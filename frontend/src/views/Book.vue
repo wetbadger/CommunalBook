@@ -1,4 +1,4 @@
-<!-- Book.vue -->
+<!-- views/Book.vue -->
 
 <template>
   <div class="book-container">
@@ -21,15 +21,29 @@
         <button 
           @click="enableDeleteMode" 
           :class="{ active: deleteMode }"
-          :disabled="authStore.deleteCredits === 0"
+          :disabled="!isAdmin && authStore.deleteCredits === 0"
         >
           🗑️ Delete Mode ({{ authStore.deleteCredits }} credits)
         </button>
         <button v-if="deleteMode" @click="cancelDeleteMode" class="cancel-btn">
           Cancel Delete Mode
         </button>
+        
+        <!-- Admin Delete All Words Button -->
+        <button 
+          v-if="isAdmin" 
+          @click="confirmDeleteAllWords" 
+          class="admin-delete-all-btn"
+          :disabled="bookStore.wordCount === 0"
+        >
+          ⚠️ Delete All Words
+        </button>
+        
         <div class="info" v-if="deleteMode">
           Click on any word (not yours) to delete it (costs 1 credit)
+        </div>
+        <div class="admin-info" v-if="isAdmin">
+          🔧 Admin Mode: Unlimited delete credits
         </div>
       </div>
 
@@ -56,7 +70,7 @@
               :data-author-name="word.authorName"
               class="word"
               :class="{ 
-                'deletable': deleteMode && word.author !== authStore.currentUser?.id,
+                'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
                 'own-word': word.author === authStore.currentUser?.id
               }"
               @click="handleWordClick($event, word)"
@@ -91,6 +105,19 @@
       </div>
     </div>
 
+    <!-- Confirmation Modal -->
+    <div v-if="showConfirmModal" class="modal-overlay" @click.self="closeModal">
+      <div class="modal-content">
+        <h3>⚠️ Delete All Words</h3>
+        <p>Are you sure you want to delete all {{ bookStore.wordCount }} words?</p>
+        <p class="warning">This action cannot be undone!</p>
+        <div class="modal-buttons">
+          <button @click="deleteAllWords" class="confirm-delete-btn">Yes, Delete All</button>
+          <button @click="closeModal" class="cancel-modal-btn">Cancel</button>
+        </div>
+      </div>
+    </div>
+
     <div v-if="message" class="message" :class="messageType">
       {{ message }}
     </div>
@@ -98,7 +125,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, onMounted, onUnmounted, nextTick, watch, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import { useBookStore } from '../stores/book'
@@ -117,8 +144,14 @@ const messageType = ref('info')
 const editorRef = ref(null)
 const inputSpanRef = ref(null)
 const activeUsers = ref(1)
+const showConfirmModal = ref(false)
 let messageTimeout = null
 let isProcessingRemoteUpdate = false
+
+// Check if current user is admin
+const isAdmin = computed(() => {
+  return authStore.currentUser?.username === 'admin'
+})
 
 const showMessage = (text, type = 'info') => {
   if (messageTimeout) clearTimeout(messageTimeout)
@@ -130,9 +163,11 @@ const showMessage = (text, type = 'info') => {
 }
 
 const enableDeleteMode = () => {
-  if (authStore.deleteCredits > 0) {
+  if (isAdmin.value || authStore.deleteCredits > 0) {
     deleteMode.value = true
-    showMessage('Delete mode activated! Click on any word (not yours) to delete it (costs 1 credit)', 'info')
+    showMessage('Delete mode activated! Click on any word to delete it' + (isAdmin.value ? ' (Admin: No credit cost)' : ' (costs 1 credit)'), 'info')
+  } else {
+    showMessage('You need delete credits to use delete mode! Write more words to earn credits (3 words = 2 credits)', 'error')
   }
 }
 
@@ -141,35 +176,69 @@ const cancelDeleteMode = () => {
   showMessage('Delete mode deactivated', 'info')
 }
 
+const confirmDeleteAllWords = () => {
+  if (bookStore.wordCount === 0) {
+    showMessage('No words to delete', 'error')
+    return
+  }
+  showConfirmModal.value = true
+}
+
+const closeModal = () => {
+  showConfirmModal.value = false
+}
+
+const deleteAllWords = async () => {
+  showConfirmModal.value = false
+  
+  const result = await bookStore.deleteAllWords()
+  if (result.success) {
+    showMessage(`Successfully deleted all ${result.deletedCount} words!`, 'success')
+    cancelDeleteMode()
+    // Refresh user stats
+    await authStore.fetchUserStats()
+  } else {
+    showMessage(result.message, 'error')
+  }
+}
+
 const handleWordClick = async (event, word) => {
   if (!deleteMode.value) return
   
   event.preventDefault()
   event.stopPropagation()
   
-  if (word.author === authStore.currentUser?.id) {
+  // Allow admin to delete any word
+  if (!isAdmin.value && word.author === authStore.currentUser?.id) {
     showMessage("You can't delete your own words!", 'error')
     return
   }
   
-  if (authStore.deleteCredits === 0) {
+  // Check credits for non-admin users
+  if (!isAdmin.value && authStore.deleteCredits === 0) {
     showMessage("You don't have any delete credits! Write more words to earn credits (3 words = 2 credits)", 'error')
     deleteMode.value = false
     return
   }
   
-  if (confirm(`Delete "${word.text}"? This will cost 1 delete credit.`)) {
+  const confirmMessage = isAdmin.value 
+    ? `Delete "${word.text}"? (Admin: No credit cost)`
+    : `Delete "${word.text}"? This will cost 1 delete credit.`
+  
+  if (confirm(confirmMessage)) {
     const result = await bookStore.deleteWord(word.position)
     if (result.success) {
-      showMessage(`"${word.text}" deleted! ${result.credits} credits remaining.`, 'success')
-      await authStore.fetchUserStats()
-      if (authStore.deleteCredits === 0) {
-        deleteMode.value = false
-        showMessage('No delete credits left. Write more words to earn more credits!', 'info')
+      showMessage(`"${word.text}" deleted! ${isAdmin.value ? 'Admin: No credits used' : `${result.credits} credits remaining.`}`, 'success')
+      if (!isAdmin.value) {
+        await authStore.fetchUserStats()
+        if (authStore.deleteCredits === 0) {
+          deleteMode.value = false
+          showMessage('No delete credits left. Write more words to earn more credits!', 'info')
+        }
       }
     } else {
       showMessage(result.message, 'error')
-      if (result.message.includes('credits')) {
+      if (!isAdmin.value && result.message.includes('credits')) {
         deleteMode.value = false
       }
     }
@@ -177,23 +246,19 @@ const handleWordClick = async (event, word) => {
 }
 
 const handleInput = (event) => {
-  // Just track input, don't do anything else
   const text = event.target.textContent
   if (text.includes(' ') || text.includes('\n')) {
-    // Space or enter was typed, submit the word
     submitCurrentWord()
   }
 }
 
 const handleKeydown = async (event) => {
-  // Submit on space or enter
   if (event.key === ' ' || event.key === 'Enter') {
     event.preventDefault()
     await submitCurrentWord()
     return
   }
   
-  // Prevent backspace when input is empty (to avoid deleting previous word)
   if (event.key === 'Backspace' && inputSpanRef.value && inputSpanRef.value.textContent.length === 0) {
     event.preventDefault()
     showMessage('Use delete mode to remove words', 'error')
@@ -210,7 +275,6 @@ const submitCurrentWord = async () => {
     const result = await bookStore.addWord(wordText)
     if (result.success) {
       await authStore.fetchUserStats()
-      // Clear the input span
       if (inputSpanRef.value) {
         inputSpanRef.value.textContent = ''
       }
@@ -219,13 +283,11 @@ const submitCurrentWord = async () => {
       showMessage(result.message, 'error')
     }
   } else {
-    // Clear empty input
     if (inputSpanRef.value) {
       inputSpanRef.value.textContent = ''
     }
   }
   
-  // Refocus the input span
   await nextTick()
   if (inputSpanRef.value) {
     inputSpanRef.value.focus()
@@ -233,8 +295,6 @@ const submitCurrentWord = async () => {
 }
 
 const handleBlur = () => {
-  // Don't auto-submit on blur to avoid accidental submissions
-  // Just clear empty input
   if (inputSpanRef.value && inputSpanRef.value.textContent.trim() === '') {
     inputSpanRef.value.textContent = ''
   }
@@ -243,7 +303,6 @@ const handleBlur = () => {
 const handlePaste = (event) => {
   event.preventDefault()
   const text = event.clipboardData.getData('text/plain')
-  // Only take the first word from paste
   const firstWord = text.trim().split(/\s+/)[0]
   if (firstWord && inputSpanRef.value) {
     inputSpanRef.value.textContent = firstWord
@@ -310,7 +369,6 @@ onMounted(async () => {
   await authStore.fetchUserStats()
   await nextTick()
   
-  // Focus the input span
   if (inputSpanRef.value) {
     inputSpanRef.value.focus()
   }
@@ -320,10 +378,7 @@ onUnmounted(() => {
   if (messageTimeout) clearTimeout(messageTimeout)
 })
 
-// Watch for word changes
 watch(() => bookStore.words, () => {
-  // Don't need to do anything here, Vue will update the DOM
-  // Just ensure input span still has focus
   nextTick(() => {
     if (inputSpanRef.value && document.activeElement !== inputSpanRef.value) {
       inputSpanRef.value.focus()
@@ -437,9 +492,28 @@ watch(() => bookStore.words, () => {
   background: #4a5568 !important;
 }
 
+.admin-delete-all-btn {
+  background: #e53e3e !important;
+  font-weight: bold;
+}
+
+.admin-delete-all-btn:hover:not(:disabled) {
+  background: #c53030 !important;
+}
+
+.admin-delete-all-btn:disabled {
+  background: #fc8181 !important;
+}
+
 .info {
   font-size: 0.875rem;
   color: #e53e3e;
+}
+
+.admin-info {
+  font-size: 0.875rem;
+  color: #38a169;
+  font-weight: bold;
 }
 
 .document {
@@ -553,6 +627,77 @@ watch(() => bookStore.words, () => {
 .message.info {
   background: #4299e1;
   color: white;
+}
+
+/* Modal Styles */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 2000;
+}
+
+.modal-content {
+  background: white;
+  padding: 2rem;
+  border-radius: 8px;
+  max-width: 400px;
+  width: 90%;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.modal-content h3 {
+  margin: 0 0 1rem 0;
+  color: #e53e3e;
+}
+
+.modal-content p {
+  margin: 0.5rem 0;
+}
+
+.modal-content .warning {
+  color: #e53e3e;
+  font-weight: bold;
+}
+
+.modal-buttons {
+  display: flex;
+  gap: 1rem;
+  margin-top: 1.5rem;
+}
+
+.confirm-delete-btn {
+  background: #e53e3e;
+  color: white;
+  border: none;
+  padding: 0.5rem 1rem;
+  border-radius: 5px;
+  cursor: pointer;
+  flex: 1;
+}
+
+.confirm-delete-btn:hover {
+  background: #c53030;
+}
+
+.cancel-modal-btn {
+  background: #718096;
+  color: white;
+  border: none;
+  padding: 0.5rem 1rem;
+  border-radius: 5px;
+  cursor: pointer;
+  flex: 1;
+}
+
+.cancel-modal-btn:hover {
+  background: #4a5568;
 }
 
 @keyframes slideIn {

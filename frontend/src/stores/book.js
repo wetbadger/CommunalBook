@@ -1,3 +1,5 @@
+// stores/book.js
+
 import { defineStore } from 'pinia'
 import axios from 'axios'
 
@@ -51,6 +53,16 @@ export const useBookStore = defineStore('book', {
         return { success: true, credits: response.data.remainingCredits }
       } catch (error) {
         return { success: false, message: error.response?.data?.message || 'Failed to delete word' }
+      }
+    },
+    
+    async deleteAllWords() {
+      try {
+        const response = await axios.delete('/api/book/words')
+        this.words = []
+        return { success: true, deletedCount: response.data.deletedCount }
+      } catch (error) {
+        return { success: false, message: error.response?.data?.message || 'Failed to delete all words' }
       }
     }
   }

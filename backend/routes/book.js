@@ -1,3 +1,5 @@
+// routes/book.js
+
 import express from 'express';
 import Word from '../models/Word.js';
 import User from '../models/User.js';
@@ -43,9 +45,15 @@ router.post('/words', authenticateToken, async (req, res) => {
     const user = await User.findById(req.user.userId);
     user.wordsWritten += 1;
     
-    // Every 5 words gives a delete credit
-    if (user.wordsWritten % 3 === 0) {
-      user.deleteCredits += 2;
+    // Only give delete credits to non-admin users
+    if (user.username !== 'admin') {
+      // Every 3 words gives 2 delete credits
+      if (user.wordsWritten % 3 === 0) {
+        user.deleteCredits += 2;
+      }
+    } else {
+      // Admin gets unlimited credits (set to a high number)
+      user.deleteCredits = 999999;
     }
     
     await user.save();
@@ -62,7 +70,10 @@ router.delete('/words/:position', authenticateToken, async (req, res) => {
   try {
     const user = await User.findById(req.user.userId);
     
-    if (user.deleteCredits <= 0) {
+    // Check if user is admin (unlimited credits)
+    const isAdmin = user.username === 'admin';
+    
+    if (!isAdmin && user.deleteCredits <= 0) {
       return res.status(403).json({ message: 'No delete credits available' });
     }
     
@@ -71,16 +82,18 @@ router.delete('/words/:position', authenticateToken, async (req, res) => {
       return res.status(404).json({ message: 'Word not found' });
     }
     
-    // Don't allow deleting own words
-    if (word.author.toString() === req.user.userId) {
+    // Don't allow deleting own words for non-admin users
+    if (!isAdmin && word.author.toString() === req.user.userId) {
       return res.status(403).json({ message: 'Cannot delete your own words' });
     }
     
     await word.deleteOne();
     
-    // Update user's delete credits
-    user.deleteCredits -= 1;
-    await user.save();
+    // Update user's delete credits (only for non-admin)
+    if (!isAdmin) {
+      user.deleteCredits -= 1;
+      await user.save();
+    }
     
     // Reorder remaining words
     const remainingWords = await Word.find({ position: { $gt: word.position } }).sort('position');
@@ -89,10 +102,39 @@ router.delete('/words/:position', authenticateToken, async (req, res) => {
       await remainingWords[i].save();
     }
     
-    res.json({ message: 'Word deleted successfully', remainingCredits: user.deleteCredits });
+    res.json({ 
+      message: 'Word deleted successfully', 
+      remainingCredits: isAdmin ? 'unlimited' : user.deleteCredits 
+    });
   } catch (error) {
     console.error('Delete word error:', error);
     res.status(500).json({ message: 'Error deleting word', error: error.message });
+  }
+});
+
+// Delete all words (admin only)
+router.delete('/words', authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    
+    // Check if user is admin
+    if (user.username !== 'admin') {
+      return res.status(403).json({ message: 'Admin access required' });
+    }
+    
+    const deletedCount = await Word.countDocuments();
+    await Word.deleteMany({});
+    
+    // Reset positions for any future words
+    // No need to reorder since all words are deleted
+    
+    res.json({ 
+      message: 'All words deleted successfully', 
+      deletedCount: deletedCount 
+    });
+  } catch (error) {
+    console.error('Delete all words error:', error);
+    res.status(500).json({ message: 'Error deleting all words', error: error.message });
   }
 });
 
@@ -102,7 +144,7 @@ router.get('/user-stats', authenticateToken, async (req, res) => {
     const user = await User.findById(req.user.userId);
     res.json({
       wordsWritten: user.wordsWritten,
-      deleteCredits: user.deleteCredits,
+      deleteCredits: user.username === 'admin' ? 'unlimited' : user.deleteCredits,
       username: user.username
     });
   } catch (error) {
