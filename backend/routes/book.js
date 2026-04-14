@@ -44,8 +44,8 @@ router.post('/words', authenticateToken, async (req, res) => {
     user.wordsWritten += 1;
     
     // Every 5 words gives a delete credit
-    if (user.wordsWritten % 5 === 0) {
-      user.deleteCredits += 1;
+    if (user.wordsWritten % 3 === 0) {
+      user.deleteCredits += 2;
     }
     
     await user.save();

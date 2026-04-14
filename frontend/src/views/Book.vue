@@ -153,7 +153,7 @@ const handleWordClick = async (event, word) => {
   }
   
   if (authStore.deleteCredits === 0) {
-    showMessage("You don't have any delete credits! Write more words to earn credits (5 words = 1 credit)", 'error')
+    showMessage("You don't have any delete credits! Write more words to earn credits (3 words = 2 credits)", 'error')
     deleteMode.value = false
     return
   }
