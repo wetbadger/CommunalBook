@@ -16,19 +16,16 @@ export const useBookStore = defineStore('book', {
   },
   
   actions: {
-    async fetchWords() {
-      this.loading = true
-      try {
-        const response = await axios.get('/api/book/words')
-        this.words = response.data
-        this.error = null
-      } catch (error) {
-        this.error = 'Failed to load the book'
-        console.error(error)
-      } finally {
-        this.loading = false
-      }
-    },
+// frontend/src/stores/book.js - Add method to get deletion cost
+async getDeletionCost(wordId) {
+  try {
+    const response = await axios.get(`/api/book/words/${wordId}/deletion-cost`);
+    return response.data;
+  } catch (error) {
+    console.error('Error getting deletion cost:', error);
+    return { cost: 1, likes: 0 };
+  }
+},
     
 // stores/book.js
 // stores/book.js

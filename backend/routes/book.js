@@ -4,6 +4,10 @@ import express from 'express';
 import Word from '../models/Word.js';
 import User from '../models/User.js';
 import { authenticateToken } from '../middleware/auth.js';
+// backend/routes/book.js - Update the delete endpoint
+// Add this import at the top
+import Stats from '../models/Stats.js';
+import { getDeletionCost } from '../utils/statsCalculator.js';
 
 const router = express.Router();
 
@@ -78,53 +82,6 @@ router.post('/words', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Add word error:', error);
     res.status(500).json({ message: 'Error adding word', error: error.message });
-  }
-});
-
-// Delete a word (requires auth)
-router.delete('/words/:position', authenticateToken, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.userId);
-    
-    // Check if user is admin (unlimited credits)
-    const isAdmin = user.username === 'admin';
-    
-    if (!isAdmin && user.deleteCredits <= 0) {
-      return res.status(403).json({ message: 'No delete credits available' });
-    }
-    
-    const word = await Word.findOne({ position: parseInt(req.params.position) });
-    if (!word) {
-      return res.status(404).json({ message: 'Word not found' });
-    }
-    
-    // Don't allow deleting own words for non-admin users
-    if (!isAdmin && word.author.toString() === req.user.userId) {
-      return res.status(403).json({ message: 'Cannot delete your own words' });
-    }
-    
-    await word.deleteOne();
-    
-    // Update user's delete credits (only for non-admin)
-    if (!isAdmin) {
-      user.deleteCredits -= 1;
-      await user.save();
-    }
-    
-    // Reorder remaining words
-    const remainingWords = await Word.find({ position: { $gt: word.position } }).sort('position');
-    for (let i = 0; i < remainingWords.length; i++) {
-      remainingWords[i].position -= 1;
-      await remainingWords[i].save();
-    }
-    
-    res.json({ 
-      message: 'Word deleted successfully', 
-      remainingCredits: isAdmin ? 'unlimited' : user.deleteCredits 
-    });
-  } catch (error) {
-    console.error('Delete word error:', error);
-    res.status(500).json({ message: 'Error deleting word', error: error.message });
   }
 });
 
@@ -247,6 +204,97 @@ router.get('/words/:wordId/like-status', authenticateToken, async (req, res) => 
   } catch (error) {
     console.error('Check like status error:', error);
     res.status(500).json({ message: 'Error checking like status', error: error.message });
+  }
+});
+
+// Update the DELETE endpoint for words
+router.delete('/words/:position', authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    
+    // Check if user is admin (unlimited credits)
+    const isAdmin = user.username === 'admin';
+    
+    const word = await Word.findOne({ position: parseInt(req.params.position) });
+    if (!word) {
+      return res.status(404).json({ message: 'Word not found' });
+    }
+    
+    // Don't allow deleting own words for non-admin users
+    if (!isAdmin && word.author.toString() === req.user.userId) {
+      return res.status(403).json({ message: 'Cannot delete your own words' });
+    }
+    
+    // Get latest stats for cost calculation
+    const stats = await Stats.findOne();
+    let deletionCost = 1;
+    
+    if (stats && !isAdmin) {
+      deletionCost = getDeletionCost(word.likes, stats.averageLikes, stats.stdDeviation);
+    }
+    
+    // Check if user has enough credits (non-admin only)
+    if (!isAdmin && user.deleteCredits < deletionCost) {
+      return res.status(403).json({ 
+        message: `Not enough credits. This word costs ${deletionCost} credit(s) to delete. You have ${user.deleteCredits} credits.`,
+        requiredCredits: deletionCost,
+        availableCredits: user.deleteCredits
+      });
+    }
+    
+    await word.deleteOne();
+    
+    // Update user's delete credits (only for non-admin)
+    if (!isAdmin) {
+      user.deleteCredits -= deletionCost;
+      await user.save();
+    }
+    
+    // Reorder remaining words
+    const remainingWords = await Word.find({ position: { $gt: word.position } }).sort('position');
+    for (let i = 0; i < remainingWords.length; i++) {
+      remainingWords[i].position -= 1;
+      await remainingWords[i].save();
+    }
+    
+    res.json({ 
+      message: 'Word deleted successfully', 
+      remainingCredits: isAdmin ? 'unlimited' : user.deleteCredits,
+      cost: deletionCost
+    });
+  } catch (error) {
+    console.error('Delete word error:', error);
+    res.status(500).json({ message: 'Error deleting word', error: error.message });
+  }
+});
+
+// Add endpoint to get deletion cost for a word
+router.get('/words/:wordId/deletion-cost', authenticateToken, async (req, res) => {
+  try {
+    const word = await Word.findById(req.params.wordId);
+    if (!word) {
+      return res.status(404).json({ message: 'Word not found' });
+    }
+    
+    const stats = await Stats.findOne();
+    let deletionCost = 1;
+    let deviation = 0;
+    
+    if (stats) {
+      deletionCost = getDeletionCost(word.likes, stats.averageLikes, stats.stdDeviation);
+      deviation = stats.stdDeviation === 0 ? 0 : (word.likes - stats.averageLikes) / stats.stdDeviation;
+    }
+    
+    res.json({
+      cost: deletionCost,
+      likes: word.likes,
+      averageLikes: stats?.averageLikes || 0,
+      stdDeviation: stats?.stdDeviation || 0,
+      deviations: deviation
+    });
+  } catch (error) {
+    console.error('Error getting deletion cost:', error);
+    res.status(500).json({ message: 'Error getting deletion cost', error: error.message });
   }
 });
 

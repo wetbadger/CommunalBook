@@ -3,8 +3,15 @@ VibeCoding Context Export
 ================================================================================
 Root directory: /workspaces/CommunalBook
 Style tag stripping: ON
-Total files: 18
+Total files: 19
 ================================================================================
+
+
+================================================================================
+FILE: .gitignore
+================================================================================
+
+scripts/vibecode_context.txt
 
 
 ================================================================================
@@ -118,6 +125,14 @@ const wordSchema = new mongoose.Schema({
     type: String,
     required: true
   },
+  likes: {
+    type: Number,
+    default: 0
+  },
+  likedBy: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  }],
   createdAt: {
     type: Date,
     default: Date.now
@@ -379,6 +394,88 @@ router.get('/user-stats', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ message: 'Error fetching user stats', error: error.message });
+  }
+});
+
+// Like a word
+router.post('/words/:wordId/like', authenticateToken, async (req, res) => {
+  try {
+    const word = await Word.findById(req.params.wordId);
+    
+    if (!word) {
+      return res.status(404).json({ message: 'Word not found' });
+    }
+    
+    // Check if user already liked this word
+    if (word.likedBy.includes(req.user.userId)) {
+      return res.status(400).json({ message: 'You already liked this word' });
+    }
+    
+    // Add like
+    word.likes += 1;
+    word.likedBy.push(req.user.userId);
+    await word.save();
+    
+    res.json({ 
+      message: 'Word liked successfully',
+      likes: word.likes,
+      liked: true
+    });
+  } catch (error) {
+    console.error('Like word error:', error);
+    res.status(500).json({ message: 'Error liking word', error: error.message });
+  }
+});
+
+// Unlike a word
+router.delete('/words/:wordId/like', authenticateToken, async (req, res) => {
+  try {
+    const word = await Word.findById(req.params.wordId);
+    
+    if (!word) {
+      return res.status(404).json({ message: 'Word not found' });
+    }
+    
+    // Check if user has liked this word
+    const likeIndex = word.likedBy.indexOf(req.user.userId);
+    if (likeIndex === -1) {
+      return res.status(400).json({ message: 'You haven\'t liked this word' });
+    }
+    
+    // Remove like
+    word.likes -= 1;
+    word.likedBy.splice(likeIndex, 1);
+    await word.save();
+    
+    res.json({ 
+      message: 'Like removed successfully',
+      likes: word.likes,
+      liked: false
+    });
+  } catch (error) {
+    console.error('Unlike word error:', error);
+    res.status(500).json({ message: 'Error unliking word', error: error.message });
+  }
+});
+
+// Check if user liked a specific word
+router.get('/words/:wordId/like-status', authenticateToken, async (req, res) => {
+  try {
+    const word = await Word.findById(req.params.wordId);
+    
+    if (!word) {
+      return res.status(404).json({ message: 'Word not found' });
+    }
+    
+    const liked = word.likedBy.includes(req.user.userId);
+    
+    res.json({ 
+      liked,
+      likes: word.likes
+    });
+  } catch (error) {
+    console.error('Check like status error:', error);
+    res.status(500).json({ message: 'Error checking like status', error: error.message });
   }
 });
 
@@ -986,7 +1083,78 @@ async addWord(wordText, insertAtPosition = null) {
       } catch (error) {
         return { success: false, message: error.response?.data?.message || 'Failed to delete all words' }
       }
+    },
+// Add these actions to your existing book store
+
+async likeWord(wordId) {
+  try {
+    const response = await axios.post(`/api/book/words/${wordId}/like`);
+    
+    // Update the word in the local store
+    const word = this.words.find(w => w._id === wordId);
+    if (word) {
+      word.likes = response.data.likes;
+      word.userLiked = true;
     }
+    
+    return { success: true, likes: response.data.likes };
+  } catch (error) {
+    return { success: false, message: error.response?.data?.message || 'Failed to like word' };
+  }
+},
+
+async unlikeWord(wordId) {
+  try {
+    const response = await axios.delete(`/api/book/words/${wordId}/like`);
+    
+    // Update the word in the local store
+    const word = this.words.find(w => w._id === wordId);
+    if (word) {
+      word.likes = response.data.likes;
+      word.userLiked = false;
+    }
+    
+    return { success: true, likes: response.data.likes };
+  } catch (error) {
+    return { success: false, message: error.response?.data?.message || 'Failed to unlike word' };
+  }
+},
+
+async checkLikeStatus(wordId) {
+  try {
+    const response = await axios.get(`/api/book/words/${wordId}/like-status`);
+    return response.data;
+  } catch (error) {
+    console.error('Error checking like status:', error);
+    return { liked: false, likes: 0 };
+  }
+},
+
+// Modify fetchWords to include user like status
+async fetchWords() {
+  this.loading = true
+  try {
+    const response = await axios.get('/api/book/words')
+    this.words = response.data
+    
+    // If user is authenticated, check like status for each word
+    const token = localStorage.getItem('token')
+    if (token) {
+      for (const word of this.words) {
+        const likeStatus = await this.checkLikeStatus(word._id)
+        word.userLiked = likeStatus.liked
+        word.likes = likeStatus.likes
+      }
+    }
+    
+    this.error = null
+  } catch (error) {
+    this.error = 'Failed to load the book'
+    console.error(error)
+  } finally {
+    this.loading = false
+  }
+}
   }
 })
 
@@ -995,7 +1163,7 @@ async addWord(wordText, insertAtPosition = null) {
 FILE: frontend/src/views/Book.vue
 ================================================================================
 
-[STRIPPED: 6109 bytes of style content]
+[STRIPPED: 6539 bytes of style content]
 
 <template>
   <div class="book-container">
@@ -1088,18 +1256,22 @@ FILE: frontend/src/views/Book.vue
               />
               
               <!-- Regular word -->
-              <span
-                class="word"
-                :class="{ 
-                  'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
-                  'own-word': word.author === authStore.currentUser?.id
-                }"
-                @click="handleWordClick($event, word)"
-                @mouseenter="showTooltip($event, word)"
-                @mouseleave="hideTooltip"
-              >
-                {{ word.text }}
-              </span>
+<!-- Regular word -->
+<span
+  class="word"
+  :class="{ 
+    'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
+    'own-word': word.author === authStore.currentUser?.id
+  }"
+  @click="handleWordClick($event, word)"
+  @mouseenter="showTooltip($event, word)"
+  @mouseleave="hideTooltip"
+>
+  {{ word.text }}
+  <span class="like-button" @click.stop="toggleLike(word)">
+    {{ word.userLiked ? '❤️' : '🤍' }}
+  </span>
+</span>
               
               <!-- Insert indicator between words -->
         <!-- And for the between indicator -->
@@ -1367,7 +1539,10 @@ const handleWordClick = async (event, word) => {
 const showTooltip = (event, word) => {
   const tooltip = document.createElement('div')
   tooltip.className = 'word-tooltip'
-  tooltip.textContent = `✍️ Written by: ${word.authorName}`
+  tooltip.innerHTML = `
+    ✍️ Written by: ${word.authorName}<br>
+    ❤️ Likes: ${word.likes || 0}
+  `
   tooltip.style.position = 'absolute'
   tooltip.style.left = `${event.clientX + 10}px`
   tooltip.style.top = `${event.clientY - 30}px`
@@ -1385,6 +1560,34 @@ const showTooltip = (event, word) => {
 const hideTooltip = (event) => {
   if (event.target._tooltip) {
     event.target._tooltip.remove()
+  }
+}
+
+const toggleLike = async (word) => {
+  if (!authStore.isAuthenticated) {
+    showMessage('Please login to like words', 'error')
+    return
+  }
+  
+  saving.value = true
+  
+  let result
+  if (word.userLiked) {
+    result = await bookStore.unlikeWord(word._id)
+    if (result.success) {
+      showMessage('Like removed', 'info')
+    }
+  } else {
+    result = await bookStore.likeWord(word._id)
+    if (result.success) {
+      showMessage('Word liked!', 'success')
+    }
+  }
+  
+  saving.value = false
+  
+  if (!result.success) {
+    showMessage(result.message, 'error')
   }
 }
 
@@ -1480,7 +1683,10 @@ const bookStore = useBookStore()
 const showTooltip = (event, word) => {
   const tooltip = document.createElement('div')
   tooltip.className = 'word-tooltip'
-  tooltip.textContent = `✍️ Written by: ${word.authorName}`
+  tooltip.innerHTML = `
+    ✍️ Written by: ${word.authorName}<br>
+    ❤️ Likes: ${word.likes || 0}
+  `
   tooltip.style.position = 'absolute'
   tooltip.style.left = `${event.clientX + 10}px`
   tooltip.style.top = `${event.clientY - 30}px`
@@ -1642,6 +1848,6 @@ const handleRegister = async () => {
 STRIPPING STATISTICS
 ================================================================================
 Files with stripped styles: 7
-Total bytes stripped: 14,210
-Total stripped: 13.88 KB
+Total bytes stripped: 14,640
+Total stripped: 14.30 KB
 ================================================================================

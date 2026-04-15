@@ -6,6 +6,19 @@ import { Server } from 'socket.io';
 import http from 'http';
 import authRoutes from './routes/auth.js';
 import bookRoutes from './routes/book.js';
+// backend/server.js - Add stats calculation scheduler
+import cron from 'node-cron';
+import { calculateLikeStats } from './utils/statsCalculator.js';
+
+// Add this after MongoDB connection
+// Calculate stats on server startup
+calculateLikeStats();
+
+// Schedule stats calculation every 5 minutes
+cron.schedule('*/5 * * * *', () => {
+  console.log('🔄 Running scheduled like stats calculation...');
+  calculateLikeStats();
+});
 
 dotenv.config();
 

@@ -90,21 +90,32 @@
               
               <!-- Regular word -->
 <!-- Regular word -->
-<span
-  class="word"
-  :class="{ 
-    'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
-    'own-word': word.author === authStore.currentUser?.id
-  }"
-  @click="handleWordClick($event, word)"
-  @mouseenter="showTooltip($event, word)"
-  @mouseleave="hideTooltip"
->
-  {{ word.text }}
-  <span class="like-button" @click.stop="toggleLike(word)">
-    {{ word.userLiked ? '❤️' : '🤍' }}
+  <!-- Update the word span to show deletion cost -->
+  <span
+    class="word"
+    :class="{ 
+      'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
+      'own-word': word.author === authStore.currentUser?.id,
+      'high-cost': deleteMode && word.deletionCost && word.deletionCost >= 100,
+      'medium-cost': deleteMode && word.deletionCost && word.deletionCost >= 10 && word.deletionCost < 100
+    }"
+    @click="handleWordClick($event, word)"
+    @mouseenter="showTooltip($event, word)"
+    @mouseleave="hideTooltip"
+  >
+    {{ word.text }}
+    <span class="like-button" @click.stop="toggleLike(word)">
+      {{ word.userLiked ? '❤️' : '🤍' }}
+    </span>
+    <span v-if="deleteMode && word.deletionCost && !isAdmin && word.author !== authStore.currentUser?.id" 
+          class="delete-cost"
+          :class="{
+            'cost-high': word.deletionCost >= 100,
+            'cost-medium': word.deletionCost >= 10 && word.deletionCost < 100
+          }">
+      {{ word.deletionCost }}
+    </span>
   </span>
-</span>
               
               <!-- Insert indicator between words -->
         <!-- And for the between indicator -->
@@ -288,15 +299,6 @@ const handleFallbackCancel = () => {
   console.log('Fallback input cancelled')
 }
 
-const enableDeleteMode = () => {
-  if (isAdmin.value || authStore.deleteCredits > 0) {
-    deleteMode.value = true
-    showMessage('Delete mode activated!', 'info')
-  } else {
-    showMessage('No delete credits available!', 'error')
-  }
-}
-
 const cancelDeleteMode = () => {
   deleteMode.value = false
   showMessage('Delete mode deactivated', 'info')
@@ -331,6 +333,7 @@ const deleteAllWords = async () => {
   }
 }
 
+// Update handleWordClick to show cost in confirmation
 const handleWordClick = async (event, word) => {
   if (!deleteMode.value) return
   
@@ -342,13 +345,21 @@ const handleWordClick = async (event, word) => {
     return
   }
   
-  if (!isAdmin.value && authStore.deleteCredits === 0) {
-    showMessage("No delete credits available!", 'error')
-    deleteMode.value = false
+  // Get cost if not already fetched
+  let cost = word.deletionCost;
+  if (!cost && !isAdmin.value) {
+    const costInfo = await bookStore.getDeletionCost(word._id);
+    cost = costInfo.cost;
+    word.deletionCost = cost;
+  }
+  
+  if (!isAdmin.value && authStore.deleteCredits < cost) {
+    showMessage(`Not enough credits! This word costs ${cost} credit(s) to delete. You have ${authStore.deleteCredits} credits.`, 'error')
     return
   }
   
-  if (confirm(`Delete "${word.text}"?`)) {
+  const costMessage = !isAdmin.value ? ` This will cost ${cost} credit(s).` : '';
+  if (confirm(`Delete "${word.text}"?${costMessage}`)) {
     saving.value = true
     
     const result = await bookStore.deleteWord(word.position)
@@ -356,38 +367,85 @@ const handleWordClick = async (event, word) => {
     saving.value = false
     
     if (result.success) {
-      showMessage(`"${word.text}" deleted!`, 'success')
+      showMessage(`"${word.text}" deleted! Cost: ${cost} credit(s)`, 'success')
       if (!isAdmin.value) {
         await authStore.fetchUserStats()
         if (authStore.deleteCredits === 0) {
           deleteMode.value = false
         }
       }
+      // Refresh deletion costs for remaining words
+      await updateDeletionCosts()
     } else {
       showMessage(result.message, 'error')
     }
   }
 }
 
-const showTooltip = (event, word) => {
-  const tooltip = document.createElement('div')
-  tooltip.className = 'word-tooltip'
-  tooltip.innerHTML = `
+// Update the fetchWords logic to include deletion costs when in delete mode
+const updateDeletionCosts = async () => {
+  if (deleteMode.value && !isAdmin.value) {
+    for (const word of bookStore.words) {
+      if (word.author !== authStore.currentUser?.id) {
+        const costInfo = await bookStore.getDeletionCost(word._id);
+        word.deletionCost = costInfo.cost;
+        word.deviations = costInfo.deviations;
+      } else {
+        word.deletionCost = 0; // Can't delete own words
+      }
+    }
+  }
+};
+
+// Update showTooltip to include deletion cost info
+const showTooltip = async (event, word) => {
+  let tooltipContent = `
     ✍️ Written by: ${word.authorName}<br>
     ❤️ Likes: ${word.likes || 0}
-  `
+  `;
+  
+  // Add deletion cost info if in delete mode and not admin
+  if (deleteMode.value && !isAdmin.value && word.author !== authStore.currentUser?.id) {
+    let costInfo = word.deletionCost;
+    if (!costInfo) {
+      costInfo = await bookStore.getDeletionCost(word._id);
+      word.deletionCost = costInfo.cost;
+      word.deviations = costInfo.deviations;
+    }
+
+    tooltipContent += `<br>💸 Deletion cost: ${costInfo} credit(s)`;
+    if (costInfo.deviations >= 1) {
+      tooltipContent += `<br>📊 ${costInfo.deviations.toFixed(1)} std dev above average`;
+    }
+  }
+  
+  const tooltip = document.createElement('div')
+  tooltip.className = 'word-tooltip'
+  tooltip.innerHTML = tooltipContent
   tooltip.style.position = 'absolute'
   tooltip.style.left = `${event.clientX + 10}px`
   tooltip.style.top = `${event.clientY - 30}px`
   tooltip.style.backgroundColor = '#2d3748'
   tooltip.style.color = 'white'
-  tooltip.style.padding = '4px 8px'
+  tooltip.style.padding = '8px 12px'
   tooltip.style.borderRadius = '4px'
   tooltip.style.fontSize = '12px'
   tooltip.style.pointerEvents = 'none'
   tooltip.style.zIndex = '1000'
+  tooltip.style.whiteSpace = 'nowrap'
   document.body.appendChild(tooltip)
   event.target._tooltip = tooltip
+}
+
+// Update enableDeleteMode to fetch costs
+const enableDeleteMode = () => {
+  if (isAdmin.value || authStore.deleteCredits > 0) {
+    deleteMode.value = true
+    updateDeletionCosts()
+    showMessage('Delete mode activated! Click on any word (not yours) to delete it', 'info')
+  } else {
+    showMessage('No delete credits available!', 'error')
+  }
 }
 
 const hideTooltip = (event) => {
@@ -456,6 +514,13 @@ onUnmounted(() => {
   // Clean up socket listeners
   socket.off('word-update')
   socket.off('word-deleted')
+})
+
+// Watch deleteMode to refresh costs when entering delete mode
+watch(deleteMode, (newVal) => {
+  if (newVal && !isAdmin.value) {
+    updateDeletionCosts()
+  }
 })
 </script>
 
@@ -892,5 +957,42 @@ onUnmounted(() => {
 
 .word:hover .like-button {
   opacity: 1;
+}
+
+/* Add these styles for delete cost badges */
+.delete-cost {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 2px 4px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: bold;
+  background-color: #ff9800;
+  color: white;
+}
+
+.cost-medium {
+  background-color: #ff5722;
+}
+
+.cost-high {
+  background-color: #f44336;
+  animation: pulse 1s infinite;
+}
+
+.high-cost {
+  background-color: rgba(244, 67, 54, 0.1);
+  border: 1px solid #f44336;
+}
+
+.medium-cost {
+  background-color: rgba(255, 87, 34, 0.1);
+  border: 1px solid #ff5722;
+}
+
+@keyframes pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.7; }
+  100% { opacity: 1; }
 }
 </style>
