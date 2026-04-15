@@ -1,0 +1,1647 @@
+================================================================================
+VibeCoding Context Export
+================================================================================
+Root directory: /workspaces/CommunalBook
+Style tag stripping: ON
+Total files: 18
+================================================================================
+
+
+================================================================================
+FILE: backend/middleware/auth.js
+================================================================================
+
+import jwt from 'jsonwebtoken';
+
+export const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ message: 'Access token required' });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key', (err, user) => {
+    if (err) {
+      return res.status(403).json({ message: 'Invalid or expired token' });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+
+================================================================================
+FILE: backend/models/User.js
+================================================================================
+
+import mongoose from 'mongoose';
+import bcrypt from 'bcryptjs';
+
+const userSchema = new mongoose.Schema({
+  username: {
+    type: String,
+    required: true,
+    unique: true,
+    trim: true
+  },
+  password: {
+    type: String,
+    required: true
+  },
+  wordsWritten: {
+    type: Number,
+    default: 0
+  },
+  deleteCredits: {
+    type: Number,
+    default: 0
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+// Fix 1: Use regular function syntax and handle next correctly
+userSchema.pre('save', async function() {
+  // Only hash the password if it's modified
+  if (!this.isModified('password')) {
+    return;
+  }
+  
+  try {
+    const salt = await bcrypt.genSalt(10);
+    this.password = await bcrypt.hash(this.password, salt);
+  } catch (error) {
+    throw new Error(`Password hashing failed: ${error.message}`);
+  }
+});
+
+// Fix 2: Alternative simpler version without try-catch
+// userSchema.pre('save', async function(next) {
+//   if (!this.isModified('password')) return next();
+//   
+//   this.password = await bcrypt.hash(this.password, 10);
+//   next();
+// });
+
+userSchema.methods.comparePassword = async function(candidatePassword) {
+  return await bcrypt.compare(candidatePassword, this.password);
+};
+
+const User = mongoose.model('User', userSchema);
+export default User;
+
+
+================================================================================
+FILE: backend/models/Word.js
+================================================================================
+
+import mongoose from 'mongoose';
+
+const wordSchema = new mongoose.Schema({
+  text: {
+    type: String,
+    required: true
+  },
+  position: {
+    type: Number,
+    required: true
+  },
+  author: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  authorName: {
+    type: String,
+    required: true
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+export default mongoose.model('Word', wordSchema);
+
+
+================================================================================
+FILE: backend/routes/auth.js
+================================================================================
+
+import express from 'express';
+import jwt from 'jsonwebtoken';
+import User from '../models/User.js';
+
+const router = express.Router();
+
+// Fix: Add 'next' as a parameter for proper error handling
+router.post('/register', async (req, res, next) => {
+  try {
+    const { username, password } = req.body;
+    
+    const existingUser = await User.findOne({ username });
+    if (existingUser) {
+      return res.status(400).json({ message: 'Username already exists' });
+    }
+    
+    const user = new User({ username, password });
+    await user.save();
+    
+    const token = jwt.sign(
+      { userId: user._id, username: user.username },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '7d' }
+    );
+    
+    res.status(201).json({ 
+      token, 
+      user: { 
+        id: user._id, 
+        username: user.username, 
+        wordsWritten: user.wordsWritten, 
+        deleteCredits: user.deleteCredits 
+      } 
+    });
+  } catch (error) {
+    // Pass error to Express error handler
+    next(error);
+  }
+});
+
+router.post('/login', async (req, res, next) => {
+  try {
+    const { username, password } = req.body;
+    
+    const user = await User.findOne({ username });
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+    
+    const isValid = await user.comparePassword(password);
+    if (!isValid) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+    
+    const token = jwt.sign(
+      { userId: user._id, username: user.username },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '7d' }
+    );
+    
+    res.json({ 
+      token, 
+      user: { 
+        id: user._id, 
+        username: user.username, 
+        wordsWritten: user.wordsWritten, 
+        deleteCredits: user.deleteCredits 
+      } 
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+export default router;
+
+
+================================================================================
+FILE: backend/routes/book.js
+================================================================================
+
+// routes/book.js
+
+import express from 'express';
+import Word from '../models/Word.js';
+import User from '../models/User.js';
+import { authenticateToken } from '../middleware/auth.js';
+
+const router = express.Router();
+
+// Test route
+router.get('/test', (req, res) => {
+  res.json({ message: 'Book routes working' });
+});
+
+// Get all words
+router.get('/words', async (req, res) => {
+  try {
+    const words = await Word.find().sort('position');
+    res.json(words);
+  } catch (error) {
+    res.status(500).json({ message: 'Error fetching words', error: error.message });
+  }
+});
+
+// Add a word (requires auth)
+// routes/book.js - Complete updated POST endpoint
+
+router.post('/words', authenticateToken, async (req, res) => {
+  try {
+    const { text, insertAtPosition } = req.body;
+    
+    if (!text || text.trim().split(/\s+/).length !== 1) {
+      return res.status(400).json({ message: 'Only single words allowed' });
+    }
+    
+    let position;
+    let wordCount = await Word.countDocuments();
+    
+    // Check if we're inserting at a specific position
+    if (insertAtPosition !== undefined && insertAtPosition !== null && insertAtPosition <= wordCount) {
+      // Inserting in the middle - shift all words from this position right
+      position = insertAtPosition;
+      await Word.updateMany(
+        { position: { $gte: insertAtPosition } },
+        { $inc: { position: 1 } }
+      );
+    } else {
+      // Append to end (default behavior)
+      position = wordCount;
+    }
+    
+    const word = new Word({
+      text: text.trim(),
+      position: position,
+      author: req.user.userId,
+      authorName: req.user.username
+    });
+    
+    await word.save();
+    
+    // Update user's word count
+    const user = await User.findById(req.user.userId);
+    user.wordsWritten += 1;
+    
+    // Only give delete credits to non-admin users
+    if (user.username !== 'admin') {
+      if (user.wordsWritten % 3 === 0) {
+        user.deleteCredits += 2;
+      }
+    } else {
+      user.deleteCredits = 999999;
+    }
+    
+    await user.save();
+    
+    // Return the updated word
+    res.status(201).json(word);
+  } catch (error) {
+    console.error('Add word error:', error);
+    res.status(500).json({ message: 'Error adding word', error: error.message });
+  }
+});
+
+// Delete a word (requires auth)
+router.delete('/words/:position', authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    
+    // Check if user is admin (unlimited credits)
+    const isAdmin = user.username === 'admin';
+    
+    if (!isAdmin && user.deleteCredits <= 0) {
+      return res.status(403).json({ message: 'No delete credits available' });
+    }
+    
+    const word = await Word.findOne({ position: parseInt(req.params.position) });
+    if (!word) {
+      return res.status(404).json({ message: 'Word not found' });
+    }
+    
+    // Don't allow deleting own words for non-admin users
+    if (!isAdmin && word.author.toString() === req.user.userId) {
+      return res.status(403).json({ message: 'Cannot delete your own words' });
+    }
+    
+    await word.deleteOne();
+    
+    // Update user's delete credits (only for non-admin)
+    if (!isAdmin) {
+      user.deleteCredits -= 1;
+      await user.save();
+    }
+    
+    // Reorder remaining words
+    const remainingWords = await Word.find({ position: { $gt: word.position } }).sort('position');
+    for (let i = 0; i < remainingWords.length; i++) {
+      remainingWords[i].position -= 1;
+      await remainingWords[i].save();
+    }
+    
+    res.json({ 
+      message: 'Word deleted successfully', 
+      remainingCredits: isAdmin ? 'unlimited' : user.deleteCredits 
+    });
+  } catch (error) {
+    console.error('Delete word error:', error);
+    res.status(500).json({ message: 'Error deleting word', error: error.message });
+  }
+});
+
+// Delete all words (admin only)
+router.delete('/words', authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    
+    // Check if user is admin
+    if (user.username !== 'admin') {
+      return res.status(403).json({ message: 'Admin access required' });
+    }
+    
+    const deletedCount = await Word.countDocuments();
+    await Word.deleteMany({});
+    
+    // Reset positions for any future words
+    // No need to reorder since all words are deleted
+    
+    res.json({ 
+      message: 'All words deleted successfully', 
+      deletedCount: deletedCount 
+    });
+  } catch (error) {
+    console.error('Delete all words error:', error);
+    res.status(500).json({ message: 'Error deleting all words', error: error.message });
+  }
+});
+
+// Get user stats
+router.get('/user-stats', authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    res.json({
+      wordsWritten: user.wordsWritten,
+      deleteCredits: user.username === 'admin' ? 'unlimited' : user.deleteCredits,
+      username: user.username
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error fetching user stats', error: error.message });
+  }
+});
+
+export default router;
+
+
+================================================================================
+FILE: backend/server.js
+================================================================================
+
+import express from 'express';
+import mongoose from 'mongoose';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import { Server } from 'socket.io';
+import http from 'http';
+import authRoutes from './routes/auth.js';
+import bookRoutes from './routes/book.js';
+
+dotenv.config();
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "http://localhost:5173",
+    credentials: true
+  }
+});
+
+// Middleware
+app.use(cors({
+  origin: 'http://localhost:5173',
+  credentials: true
+}));
+app.use(express.json());
+
+// Make io accessible to routes
+app.set('io', io);
+
+// MongoDB connection
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/collaborative-book')
+.then(() => {
+  console.log('✅ MongoDB connected successfully');
+  console.log('Database:', mongoose.connection.name);
+})
+.catch(err => {
+  console.error('❌ MongoDB connection error:', err.message);
+  console.error('\n💡 Troubleshooting tips:');
+  console.error('1. Make sure MongoDB is installed and running');
+  console.error('2. Check your MONGODB_URI in .env file');
+  process.exit(1);
+});
+
+// Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/book', bookRoutes);
+
+// WebSocket connection handling
+io.on('connection', (socket) => {
+  console.log('🔌 User connected:', socket.id);
+  
+  // Handle word added event
+  socket.on('word-added', (data) => {
+    console.log('Word added:', data);
+    // Broadcast to all other users
+    socket.broadcast.emit('word-update', { type: 'add', data });
+  });
+  
+  // Handle word deleted event
+  socket.on('word-deleted', (data) => {
+    console.log('Word deleted:', data);
+    // Broadcast to all other users
+    socket.broadcast.emit('word-update', { type: 'delete', data });
+  });
+  
+  // Handle user typing indicator
+  socket.on('user-typing', (data) => {
+    socket.broadcast.emit('user-typing', { 
+      userId: socket.id, 
+      username: data.username 
+    });
+  });
+  
+  // Handle disconnect
+  socket.on('disconnect', () => {
+    console.log('🔌 User disconnected:', socket.id);
+    socket.broadcast.emit('user-left', { userId: socket.id });
+  });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Server error:', err);
+  res.status(500).json({ 
+    message: 'Internal server error', 
+    error: err.message 
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ message: 'Route not found' });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`✅ Server running on http://localhost:${PORT}`);
+  console.log(`📡 WebSocket server ready for connections`);
+});
+
+
+================================================================================
+FILE: frontend/index.html
+================================================================================
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Collaborative Book - Write Together</title>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
+
+
+================================================================================
+FILE: frontend/src/App.vue
+================================================================================
+
+[STRIPPED: 193 bytes of style content]
+
+<template>
+  <router-view />
+</template>
+
+<script setup>
+import { onMounted } from 'vue'
+import { useAuthStore } from './stores/auth'
+import axios from 'axios'
+
+onMounted(() => {
+  const token = localStorage.getItem('token')
+  if (token) {
+    axios.defaults.headers.common['Authorization'] = `Bearer ${token}`
+  }
+})
+</script>
+
+
+================================================================================
+FILE: frontend/src/components/BackToHome.vue
+================================================================================
+
+[STRIPPED: 615 bytes of style content]
+
+<template>
+  <div class="back-link" :class="customClass">
+    <router-link to="/" class="home-link">
+      <span class="arrow">←</span>
+      <span class="text">{{ text }}</span>
+    </router-link>
+  </div>
+</template>
+
+<script setup>
+defineProps({
+  text: {
+    type: String,
+    default: 'Back to Home'
+  },
+  customClass: {
+    type: String,
+    default: ''
+  }
+})
+</script>
+
+
+================================================================================
+FILE: frontend/src/components/WordInput.vue
+================================================================================
+
+[STRIPPED: 825 bytes of style content]
+
+<!-- components/WordInput.vue -->
+<template>
+  <span 
+    ref="inputRef"
+    class="word-input"
+    :class="{
+      'inline-mode': mode === 'inline',
+      'fallback-mode': mode === 'fallback',
+      'active': isActive
+    }"
+    contenteditable="true"
+    @input="handleInput"
+    @keydown="handleKeydown"
+    @blur="handleBlur"
+    @paste="handlePaste"
+    :data-placeholder="placeholder"
+  ></span>
+</template>
+
+<script setup>
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
+
+const props = defineProps({
+  mode: {
+    type: String,
+    required: true,
+    validator: (value) => ['inline', 'fallback'].includes(value)
+  },
+  insertPosition: {
+    type: Number,
+    default: null
+  },
+  isActive: {
+    type: Boolean,
+    default: false
+  },
+  autoFocus: {
+    type: Boolean,
+    default: false
+  }
+})
+
+const emit = defineEmits(['submit', 'cancel'])
+
+const inputRef = ref(null)
+const localText = ref('')
+const isMounted = ref(false)
+const suppressOutsideClick = ref(false)
+
+const placeholder = computed(() => {
+  if (props.mode === 'inline' && props.insertPosition !== null) {
+    return `Insert at position ${props.insertPosition}...`
+  }
+  return 'Type a word...'
+})
+
+// Handle click outside
+const handleClickOutside = (event) => {
+  // Skip if we're suppressing outside clicks (just mounted)
+  if (suppressOutsideClick.value) {
+    return
+  }
+  
+  // Only handle if component is mounted and active
+  if (!isMounted.value) return
+  if (props.mode === 'inline' && props.isActive && inputRef.value) {
+    // Check if click is outside the input element
+    if (!inputRef.value.contains(event.target)) {
+      if (localText.value.trim() === '') {
+        console.log('Click outside, cancelling')
+        cancel()
+      }
+    }
+  }
+}
+
+// Add and remove click outside listener
+onMounted(() => {
+  isMounted.value = true
+  
+  // Suppress outside clicks for a short time to prevent the triggering click from canceling
+  suppressOutsideClick.value = true
+  setTimeout(() => {
+    suppressOutsideClick.value = false
+  }, 200)
+  
+  document.addEventListener('click', handleClickOutside)
+})
+
+onUnmounted(() => {
+  isMounted.value = false
+  document.removeEventListener('click', handleClickOutside)
+})
+
+const handleInput = (event) => {
+  localText.value = event.target.textContent
+  if (localText.value.includes(' ') || localText.value.includes('\n')) {
+    submit()
+  }
+}
+
+const handleKeydown = async (event) => {
+  if (event.key === ' ' || event.key === 'Enter') {
+    event.preventDefault()
+    await submit()
+    return
+  }
+  
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    cancel()
+    return
+  }
+  
+  // Prevent backspace when empty
+  if (event.key === 'Backspace' && localText.value.length === 0) {
+    event.preventDefault()
+  }
+}
+
+const handleBlur = () => {
+  //console.log('Input blurred')
+}
+
+const handlePaste = (event) => {
+  event.preventDefault()
+  const text = event.clipboardData.getData('text/plain')
+  const firstWord = text.trim().split(/\s+/)[0]
+  if (firstWord) {
+    localText.value = firstWord
+    if (inputRef.value) {
+      inputRef.value.textContent = firstWord
+    }
+    submit()
+  }
+}
+
+const submit = async () => {
+  const wordText = localText.value.trim()
+  
+  if (wordText) {
+    console.log('Submitting word:', wordText)
+    emit('submit', {
+      text: wordText,
+      position: props.insertPosition
+    })
+    clear()
+  } else {
+    cancel()
+  }
+}
+
+const cancel = () => {
+  console.log('Cancelling input')
+  clear()
+  emit('cancel')
+}
+
+const clear = () => {
+  localText.value = ''
+  if (inputRef.value) {
+    inputRef.value.textContent = ''
+  }
+}
+
+const focus = () => {
+  nextTick(() => {
+    if (inputRef.value) {
+      inputRef.value.focus()
+      
+      // Place cursor at the end
+      const range = document.createRange()
+      const sel = window.getSelection()
+      range.selectNodeContents(inputRef.value)
+      range.collapse(false)
+      sel?.removeAllRanges()
+      sel?.addRange(range)
+    }
+  })
+}
+
+// Watch for autoFocus prop
+watch(() => props.autoFocus, (shouldFocus) => {
+  if (shouldFocus && props.isActive && isMounted.value) {
+    focus()
+  }
+})
+
+// Focus when component becomes active
+watch(() => props.isActive, (active) => {
+  if (active && props.autoFocus && isMounted.value) {
+    focus()
+  }
+})
+
+onMounted(() => {
+  if (props.autoFocus && props.isActive) {
+    focus()
+  }
+})
+
+// Expose methods for parent component
+defineExpose({
+  focus,
+  clear,
+  getText: () => localText.value
+})
+</script>
+
+
+================================================================================
+FILE: frontend/src/main.js
+================================================================================
+
+import { createApp } from 'vue'
+import { createPinia } from 'pinia'
+import App from './App.vue'
+import router from './router'
+
+const app = createApp(App)
+const pinia = createPinia()
+
+app.use(pinia)
+app.use(router)
+app.mount('#app')
+
+
+================================================================================
+FILE: frontend/src/router/index.js
+================================================================================
+
+import { createRouter, createWebHistory } from 'vue-router'
+import Login from '../views/Login.vue'
+import Register from '../views/Register.vue'
+import Book from '../views/Book.vue'
+import Home from '../views/Home.vue'
+import { useAuthStore } from '../stores/auth'
+
+const routes = [
+  { path: '/', component: Home },
+  { path: '/login', component: Login, meta: { requiresGuest: true } },
+  { path: '/register', component: Register, meta: { requiresGuest: true } },
+  { path: '/book', component: Book, meta: { requiresAuth: true } }
+]
+
+const router = createRouter({
+  history: createWebHistory(),
+  routes
+})
+
+router.beforeEach((to, from) => {
+  const authStore = useAuthStore()
+  
+  if (to.meta.requiresAuth && !authStore.isAuthenticated) {
+    return '/login'
+  } else if (to.meta.requiresGuest && authStore.isAuthenticated) {
+    return '/book'
+  } else {
+    return true
+  }
+})
+
+export default router
+
+
+================================================================================
+FILE: frontend/src/stores/auth.js
+================================================================================
+
+import { defineStore } from 'pinia'
+import axios from 'axios'
+
+export const useAuthStore = defineStore('auth', {
+  state: () => ({
+    token: localStorage.getItem('token'),
+    user: null
+  }),
+  
+  getters: {
+    isAuthenticated: (state) => !!state.token,
+    currentUser: (state) => state.user,
+    deleteCredits: (state) => state.user?.deleteCredits || 0,
+    wordsWritten: (state) => state.user?.wordsWritten || 0
+  },
+  
+  actions: {
+    setAuth(token, user) {
+      this.token = token
+      this.user = user
+      localStorage.setItem('token', token)
+      axios.defaults.headers.common['Authorization'] = `Bearer ${token}`
+    },
+    
+    clearAuth() {
+      this.token = null
+      this.user = null
+      localStorage.removeItem('token')
+      delete axios.defaults.headers.common['Authorization']
+    },
+    
+    async login(username, password) {
+      try {
+        const response = await axios.post('/api/auth/login', { username, password })
+        this.setAuth(response.data.token, response.data.user)
+        return { success: true }
+      } catch (error) {
+        return { success: false, message: error.response?.data?.message || 'Login failed' }
+      }
+    },
+    
+    async register(username, password) {
+      try {
+        const response = await axios.post('/api/auth/register', { username, password })
+        this.setAuth(response.data.token, response.data.user)
+        return { success: true }
+      } catch (error) {
+        return { success: false, message: error.response?.data?.message || 'Registration failed' }
+      }
+    },
+    
+    async fetchUserStats() {
+      if (!this.token) return
+      try {
+        const response = await axios.get('/api/book/user-stats')
+        this.user = { ...this.user, ...response.data }
+      } catch (error) {
+        console.error('Error fetching user stats:', error)
+      }
+    },
+    
+    logout() {
+      this.clearAuth()
+    }
+  }
+})
+
+
+================================================================================
+FILE: frontend/src/stores/book.js
+================================================================================
+
+// stores/book.js
+
+import { defineStore } from 'pinia'
+import axios from 'axios'
+
+export const useBookStore = defineStore('book', {
+  state: () => ({
+    words: [],
+    loading: false,
+    error: null
+  }),
+  
+  getters: {
+    bookText: (state) => state.words.map(w => w.text).join(' '),
+    wordCount: (state) => state.words.length
+  },
+  
+  actions: {
+    async fetchWords() {
+      this.loading = true
+      try {
+        const response = await axios.get('/api/book/words')
+        this.words = response.data
+        this.error = null
+      } catch (error) {
+        this.error = 'Failed to load the book'
+        console.error(error)
+      } finally {
+        this.loading = false
+      }
+    },
+    
+// stores/book.js
+// stores/book.js
+
+async addWord(wordText, insertAtPosition = null) {
+  try {
+    const payload = { text: wordText };
+    if (insertAtPosition !== null && insertAtPosition !== undefined) {
+      payload.insertAtPosition = insertAtPosition;
+    }
+    
+    const response = await axios.post('/api/book/words', payload);
+    
+    // Refetch all words to get updated positions
+    await this.fetchWords();
+    
+    return { success: true, word: response.data };
+  } catch (error) {
+    return { success: false, message: error.response?.data?.message || 'Failed to add word' };
+  }
+},
+    
+    async deleteWord(position) {
+      try {
+        const response = await axios.delete(`/api/book/words/${position}`)
+        this.words = this.words.filter(w => w.position !== position)
+        // Update positions of words after the deleted one
+        this.words.forEach(word => {
+          if (word.position > position) {
+            word.position -= 1
+          }
+        })
+        return { success: true, credits: response.data.remainingCredits }
+      } catch (error) {
+        return { success: false, message: error.response?.data?.message || 'Failed to delete word' }
+      }
+    },
+    
+    async deleteAllWords() {
+      try {
+        const response = await axios.delete('/api/book/words')
+        this.words = []
+        return { success: true, deletedCount: response.data.deletedCount }
+      } catch (error) {
+        return { success: false, message: error.response?.data?.message || 'Failed to delete all words' }
+      }
+    }
+  }
+})
+
+
+================================================================================
+FILE: frontend/src/views/Book.vue
+================================================================================
+
+[STRIPPED: 6109 bytes of style content]
+
+<template>
+  <div class="book-container">
+    <header class="header">
+      <div class="header-left">
+        <h1>📖 Collaborative Book</h1>
+        <div class="stats">
+          <span>✍️ {{ authStore.wordsWritten }} words</span>
+          <span>🗑️ {{ authStore.deleteCredits === 'unlimited' ? '∞' : authStore.deleteCredits }} credits</span>
+        </div>
+      </div>
+      <div class="user-info">
+        <span>👤 {{ authStore.currentUser?.username }}</span>
+        <button @click="logout" class="logout-btn">Logout</button>
+      </div>
+    </header>
+
+    <div class="editor-container">
+      <div class="toolbar">
+        <button 
+          @click="enableDeleteMode" 
+          :class="{ active: deleteMode }"
+          :disabled="!isAdmin && authStore.deleteCredits === 0"
+        >
+          🗑️ Delete Mode ({{ authStore.deleteCredits === 'unlimited' ? '∞' : authStore.deleteCredits }} credits)
+        </button>
+        <button v-if="deleteMode" @click="cancelDeleteMode" class="cancel-btn">
+          Cancel Delete Mode
+        </button>
+        
+        <!-- Admin Delete All Words Button -->
+        <button 
+          v-if="isAdmin" 
+          @click="confirmDeleteAllWords" 
+          class="admin-delete-all-btn"
+          :disabled="bookStore.wordCount === 0"
+        >
+          ⚠️ Delete All Words
+        </button>
+        
+        <button v-if="activeInsertPosition !== null" @click="cancelInsertMode" class="cancel-btn">
+          Cancel Insert Mode
+        </button>
+        
+        <div class="info" v-if="deleteMode">
+          Click on any word (not yours) to delete it (costs 1 credit)
+        </div>
+        <div class="insert-info" v-if="activeInsertPosition !== null">
+          📍 Inserting at position {{ activeInsertPosition }}. Type your word and press Enter/Space
+        </div>
+        <div class="admin-info" v-if="isAdmin">
+          🔧 Admin Mode: Unlimited delete credits
+        </div>
+      </div>
+
+      <div class="document">
+        <div 
+          v-if="bookStore.loading" 
+          class="loading"
+        >
+          Loading document...
+        </div>
+        
+        <div 
+          v-else 
+          class="words-container"
+          ref="editorRef"
+        >
+          <div class="words-wrapper">
+            <!-- Insert at beginning -->
+            <span 
+              v-if="!deleteMode && activeInsertPosition !== 0" 
+              class="insert-indicator insert-beginning"
+              @click.stop="activateInsertAt(0)"
+              title="Insert at beginning"
+            >
+              ⬅️ Insert here
+            </span>
+            
+            <template v-for="word in bookStore.words" :key="word.id">
+              <!-- Inline input component at specific position -->
+              <WordInput
+                v-if="activeInsertPosition === word.position"
+                mode="inline"
+                :insert-position="word.position"
+                :is-active="true"
+                :auto-focus="true"
+                @submit="handleWordSubmit"
+                @cancel="cancelInlineInsert"
+              />
+              
+              <!-- Regular word -->
+              <span
+                class="word"
+                :class="{ 
+                  'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
+                  'own-word': word.author === authStore.currentUser?.id
+                }"
+                @click="handleWordClick($event, word)"
+                @mouseenter="showTooltip($event, word)"
+                @mouseleave="hideTooltip"
+              >
+                {{ word.text }}
+              </span>
+              
+              <!-- Insert indicator between words -->
+        <!-- And for the between indicator -->
+        <span 
+          v-if="!deleteMode && activeInsertPosition !== word.position + 1" 
+          class="insert-indicator insert-between"
+          @click.stop="activateInsertAt(word.position + 1)"
+          :title="`Insert after '${word.text}'`"
+        >
+          ➕
+        </span>
+            </template>
+            
+            <!-- Inline input at the end -->
+            <WordInput
+              v-if="activeInsertPosition === bookStore.wordCount"
+              mode="inline"
+              :insert-position="bookStore.wordCount"
+              :is-active="true"
+              :auto-focus="true"
+              @submit="handleWordSubmit"
+              @cancel="cancelInlineInsert"
+            />
+            
+            <!-- Insert at end indicator -->
+            <span 
+              v-if="!deleteMode && activeInsertPosition !== bookStore.wordCount" 
+              class="insert-indicator insert-end"
+              @click.stop="activateInsertAt(bookStore.wordCount)"
+              title="Insert at end"
+            >
+              Insert here ➡️
+            </span>
+            
+            <!-- Fallback input component -->
+            <WordInput
+              v-if="activeInsertPosition === null"
+              ref="fallbackInput"
+              mode="fallback"
+              :is-active="true"
+              :auto-focus="true"
+              @submit="handleWordSubmit"
+              @cancel="handleFallbackCancel"
+            />
+          </div>
+        </div>
+      </div>
+
+      <div class="status-bar">
+        <div class="status-left">
+          <span>📊 Total words: {{ bookStore.wordCount }}</span>
+          <span>👥 Active users: {{ activeUsers }}</span>
+        </div>
+        <div class="status-right">
+          <span v-if="saving">💾 Saving...</span>
+          <span v-else>✅ All changes saved</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Confirmation Modal -->
+    <div v-if="showConfirmModal" class="modal-overlay" @click.self="closeModal">
+      <div class="modal-content">
+        <h3>⚠️ Delete All Words</h3>
+        <p>Are you sure you want to delete all {{ bookStore.wordCount }} words?</p>
+        <p class="warning">This action cannot be undone!</p>
+        <div class="modal-buttons">
+          <button @click="deleteAllWords" class="confirm-delete-btn">Yes, Delete All</button>
+          <button @click="closeModal" class="cancel-modal-btn">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="message" class="message" :class="messageType">
+      {{ message }}
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { useRouter } from 'vue-router'
+import { useAuthStore } from '../stores/auth'
+import { useBookStore } from '../stores/book'
+import { io } from 'socket.io-client'
+import WordInput from '../components/WordInput.vue'
+
+const socket = io('http://localhost:3000')
+const router = useRouter()
+const authStore = useAuthStore()
+const bookStore = useBookStore()
+
+const deleteMode = ref(false)
+const activeInsertPosition = ref(null)
+const fallbackInput = ref(null)
+const message = ref('')
+const messageType = ref('info')
+const showConfirmModal = ref(false)
+const activeUsers = ref(1)
+const saving = ref(false)
+let messageTimeout = null
+let isProcessingRemoteUpdate = false
+
+const isAdmin = computed(() => authStore.currentUser?.username === 'admin')
+
+const showMessage = (text, type = 'info') => {
+  if (messageTimeout) clearTimeout(messageTimeout)
+  message.value = text
+  messageType.value = type
+  messageTimeout = setTimeout(() => {
+    message.value = ''
+  }, 3000)
+}
+
+const activateInsertAt = (position) => {
+  if (deleteMode.value) {
+    showMessage('Please exit delete mode first', 'error')
+    return
+  }
+  
+  // Prevent if already active at same position
+  if (activeInsertPosition.value === position) {
+    console.log('Already active at this position')
+    return
+  }
+  
+  activeInsertPosition.value = position
+  showMessage(`Insert mode active at position ${position}. Type your word.`, 'info')
+}
+
+const cancelInlineInsert = () => {
+  activeInsertPosition.value = null
+  showMessage('Insert mode cancelled', 'info')
+}
+
+const cancelInsertMode = () => {
+  cancelInlineInsert()
+}
+
+const handleWordSubmit = async ({ text, position }) => {
+  saving.value = true
+  
+  const result = await bookStore.addWord(text, position)
+  
+  saving.value = false
+  
+  if (result.success) {
+    await authStore.fetchUserStats()
+    
+    if (position !== null) {
+      // After inserting at position, move to the next position
+      // This keeps the input at the location where you just inserted
+      const nextPosition = position + 1
+      
+      // If there's a word after this position, we need to adjust
+      // because the words array has shifted
+      if (nextPosition <= bookStore.wordCount) {
+        // Keep the insert mode active at the next position
+        activeInsertPosition.value = nextPosition
+        showMessage(`Added "${text}"! Keep typing...`, 'success')
+      } else {
+        // If we're at the end, you could either:
+        // Option 1: Keep at the end (still in insert mode)
+        activeInsertPosition.value = nextPosition
+        showMessage(`Added "${text}"! Keep typing at the end...`, 'success')
+        
+        // Option 2: Or cancel insert mode (uncomment if preferred)
+        // activeInsertPosition.value = null
+        // showMessage(`Added "${text}" at position ${position}!`, 'success')
+      }
+    } else {
+      // Fallback append - keep the fallback input active
+      showMessage(`Added "${text}"! Keep typing...`, 'success')
+    }
+  } else {
+    showMessage(result.message, 'error')
+  }
+}
+
+const handleFallbackCancel = () => {
+  console.log('Fallback input cancelled')
+}
+
+const enableDeleteMode = () => {
+  if (isAdmin.value || authStore.deleteCredits > 0) {
+    deleteMode.value = true
+    showMessage('Delete mode activated!', 'info')
+  } else {
+    showMessage('No delete credits available!', 'error')
+  }
+}
+
+const cancelDeleteMode = () => {
+  deleteMode.value = false
+  showMessage('Delete mode deactivated', 'info')
+}
+
+const confirmDeleteAllWords = () => {
+  if (bookStore.wordCount === 0) {
+    showMessage('No words to delete', 'error')
+    return
+  }
+  showConfirmModal.value = true
+}
+
+const closeModal = () => {
+  showConfirmModal.value = false
+}
+
+const deleteAllWords = async () => {
+  showConfirmModal.value = false
+  saving.value = true
+  
+  const result = await bookStore.deleteAllWords()
+  
+  saving.value = false
+  
+  if (result.success) {
+    showMessage(`Successfully deleted all ${result.deletedCount} words!`, 'success')
+    cancelDeleteMode()
+    await authStore.fetchUserStats()
+  } else {
+    showMessage(result.message, 'error')
+  }
+}
+
+const handleWordClick = async (event, word) => {
+  if (!deleteMode.value) return
+  
+  event.preventDefault()
+  event.stopPropagation()
+  
+  if (!isAdmin.value && word.author === authStore.currentUser?.id) {
+    showMessage("You can't delete your own words!", 'error')
+    return
+  }
+  
+  if (!isAdmin.value && authStore.deleteCredits === 0) {
+    showMessage("No delete credits available!", 'error')
+    deleteMode.value = false
+    return
+  }
+  
+  if (confirm(`Delete "${word.text}"?`)) {
+    saving.value = true
+    
+    const result = await bookStore.deleteWord(word.position)
+    
+    saving.value = false
+    
+    if (result.success) {
+      showMessage(`"${word.text}" deleted!`, 'success')
+      if (!isAdmin.value) {
+        await authStore.fetchUserStats()
+        if (authStore.deleteCredits === 0) {
+          deleteMode.value = false
+        }
+      }
+    } else {
+      showMessage(result.message, 'error')
+    }
+  }
+}
+
+const showTooltip = (event, word) => {
+  const tooltip = document.createElement('div')
+  tooltip.className = 'word-tooltip'
+  tooltip.textContent = `✍️ Written by: ${word.authorName}`
+  tooltip.style.position = 'absolute'
+  tooltip.style.left = `${event.clientX + 10}px`
+  tooltip.style.top = `${event.clientY - 30}px`
+  tooltip.style.backgroundColor = '#2d3748'
+  tooltip.style.color = 'white'
+  tooltip.style.padding = '4px 8px'
+  tooltip.style.borderRadius = '4px'
+  tooltip.style.fontSize = '12px'
+  tooltip.style.pointerEvents = 'none'
+  tooltip.style.zIndex = '1000'
+  document.body.appendChild(tooltip)
+  event.target._tooltip = tooltip
+}
+
+const hideTooltip = (event) => {
+  if (event.target._tooltip) {
+    event.target._tooltip.remove()
+  }
+}
+
+const logout = () => {
+  authStore.logout()
+  router.push('/')
+}
+
+// Socket.io handlers
+socket.on('word-update', async () => {
+  if (!isProcessingRemoteUpdate) {
+    isProcessingRemoteUpdate = true
+    await bookStore.fetchWords()
+    isProcessingRemoteUpdate = false
+  }
+})
+
+socket.on('word-deleted', async () => {
+  if (!isProcessingRemoteUpdate) {
+    isProcessingRemoteUpdate = true
+    await bookStore.fetchWords()
+    isProcessingRemoteUpdate = false
+  }
+})
+
+onMounted(async () => {
+  await bookStore.fetchWords()
+  await authStore.fetchUserStats()
+})
+
+onUnmounted(() => {
+  if (messageTimeout) clearTimeout(messageTimeout)
+  // Clean up socket listeners
+  socket.off('word-update')
+  socket.off('word-deleted')
+})
+</script>
+
+
+
+================================================================================
+FILE: frontend/src/views/Home.vue
+================================================================================
+
+[STRIPPED: 4019 bytes of style content]
+
+<template>
+    <ul class="toolbar">
+        <li>
+            <a href="/login">Log in</a>
+        </li>
+        <li>
+            <a href="/register">Register</a>
+        </li>
+    </ul>
+
+    <h1 class="title">Collaborative Book</h1>
+
+    <div class="document">
+        <div 
+            v-if="bookStore.loading" 
+            class="loading"
+        >
+            Loading document...
+        </div>
+        <div 
+        v-else 
+        class="words-container"
+        ref="editorRef"
+        >
+            <div class="words-wrapper">
+                <template v-for="word in bookStore.words" :key="word.id">
+                    <!-- Regular word -->
+                    <span
+                        class="word"
+                        @mouseenter="showTooltip($event, word)"
+                        @mouseleave="hideTooltip"
+                    >
+                        {{ word.text }}
+                    </span>
+                    &nbsp;
+                </template>
+            </div>
+        </div>
+    </div>
+</template>
+
+<script setup>
+import { onMounted } from 'vue'
+import { useBookStore } from '../stores/book'
+const bookStore = useBookStore()
+
+const showTooltip = (event, word) => {
+  const tooltip = document.createElement('div')
+  tooltip.className = 'word-tooltip'
+  tooltip.textContent = `✍️ Written by: ${word.authorName}`
+  tooltip.style.position = 'absolute'
+  tooltip.style.left = `${event.clientX + 10}px`
+  tooltip.style.top = `${event.clientY - 30}px`
+  tooltip.style.backgroundColor = '#2d3748'
+  tooltip.style.color = 'white'
+  tooltip.style.padding = '4px 8px'
+  tooltip.style.borderRadius = '4px'
+  tooltip.style.fontSize = '12px'
+  tooltip.style.pointerEvents = 'none'
+  tooltip.style.zIndex = '1000'
+  document.body.appendChild(tooltip)
+  event.target._tooltip = tooltip
+}
+
+const hideTooltip = (event) => {
+  if (event.target._tooltip) {
+    event.target._tooltip.remove()
+  }
+}
+
+onMounted(async () => {
+  await bookStore.fetchWords()
+})
+</script>
+
+
+
+================================================================================
+FILE: frontend/src/views/Login.vue
+================================================================================
+
+[STRIPPED: 1415 bytes of style content]
+
+<template>
+  <div class="auth-container">
+    <div class="auth-card">
+      <!-- Reusable back button component -->
+      <BackToHome />
+      
+      <h2>Login to Collaborative Book</h2>
+      <form @submit.prevent="handleLogin">
+        <div class="form-group">
+          <input
+            v-model="username"
+            type="text"
+            placeholder="Username"
+            required
+          />
+        </div>
+        <div class="form-group">
+          <input
+            v-model="password"
+            type="password"
+            placeholder="Password"
+            required
+          />
+        </div>
+        <button type="submit" :disabled="loading">Login</button>
+        <p v-if="error" class="error">{{ error }}</p>
+        <p>Don't have an account? <router-link to="/register">Register</router-link></p>
+      </form>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { useAuthStore } from '../stores/auth'
+import BackToHome from '../components/BackToHome.vue' // Adjust path as needed
+
+const router = useRouter()
+const authStore = useAuthStore()
+const username = ref('')
+const password = ref('')
+const loading = ref(false)
+const error = ref('')
+
+const handleLogin = async () => {
+  loading.value = true
+  error.value = ''
+  const result = await authStore.login(username.value, password.value)
+  if (result.success) {
+    router.push('/book')
+  } else {
+    error.value = result.message
+  }
+  loading.value = false
+}
+</script>
+
+
+================================================================================
+FILE: frontend/src/views/Register.vue
+================================================================================
+
+[STRIPPED: 1034 bytes of style content]
+
+<template>
+  <div class="auth-container">
+    <div class="auth-card">
+      <!-- Reusable back button component -->
+      <BackToHome />
+
+      <h2>Register for Collaborative Book</h2>
+      <form @submit.prevent="handleRegister">
+        <div class="form-group">
+          <input
+            v-model="username"
+            type="text"
+            placeholder="Username"
+            required
+          />
+        </div>
+        <div class="form-group">
+          <input
+            v-model="password"
+            type="password"
+            placeholder="Password"
+            required
+          />
+        </div>
+        <button type="submit" :disabled="loading">Register</button>
+        <p v-if="error" class="error">{{ error }}</p>
+        <p>Already have an account? <router-link to="/login">Login</router-link></p>
+      </form>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { useAuthStore } from '../stores/auth'
+import BackToHome from '../components/BackToHome.vue' // Adjust path as needed
+
+const router = useRouter()
+const authStore = useAuthStore()
+const username = ref('')
+const password = ref('')
+const loading = ref(false)
+const error = ref('')
+
+const handleRegister = async () => {
+  loading.value = true
+  error.value = ''
+  const result = await authStore.register(username.value, password.value)
+  if (result.success) {
+    router.push('/book')
+  } else {
+    error.value = result.message
+  }
+  loading.value = false
+}
+</script>
+
+
+================================================================================
+STRIPPING STATISTICS
+================================================================================
+Files with stripped styles: 7
+Total bytes stripped: 14,210
+Total stripped: 13.88 KB
+================================================================================
