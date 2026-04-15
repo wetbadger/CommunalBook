@@ -1,25 +1,19 @@
 // routes/book.js
-
+// routes/book.js
 import express from 'express';
 import Word from '../models/Word.js';
 import User from '../models/User.js';
 import { authenticateToken } from '../middleware/auth.js';
-// backend/routes/book.js - Update the delete endpoint
-// Add this import at the top
 import Stats from '../models/Stats.js';
 import { getDeletionCost } from '../utils/statsCalculator.js';
+import linkedListService from '../services/linkedListService.js';
 
 const router = express.Router();
 
-// Test route
-router.get('/test', (req, res) => {
-  res.json({ message: 'Book routes working' });
-});
-
-// Get all words
+// Get all words (now using linked list)
 router.get('/words', async (req, res) => {
   try {
-    const words = await Word.find().sort('position');
+    const words = await linkedListService.getBookInOrder();
     res.json(words);
   } catch (error) {
     res.status(500).json({ message: 'Error fetching words', error: error.message });
@@ -28,7 +22,7 @@ router.get('/words', async (req, res) => {
 
 // Add a word (requires auth)
 // routes/book.js - Complete updated POST endpoint
-
+// Add a word using linked list
 router.post('/words', authenticateToken, async (req, res) => {
   try {
     const { text, insertAtPosition } = req.body;
@@ -38,35 +32,25 @@ router.post('/words', authenticateToken, async (req, res) => {
     }
     
     let position;
-    let wordCount = await Word.countDocuments();
+    const wordCount = await linkedListService.getWordCount();
     
-    // Check if we're inserting at a specific position
+    // Determine insertion position
     if (insertAtPosition !== undefined && insertAtPosition !== null && insertAtPosition <= wordCount) {
-      // Inserting in the middle - shift all words from this position right
       position = insertAtPosition;
-      await Word.updateMany(
-        { position: { $gte: insertAtPosition } },
-        { $inc: { position: 1 } }
-      );
     } else {
-      // Append to end (default behavior)
-      position = wordCount;
+      position = wordCount; // Append to end
     }
     
-    const word = new Word({
+    const newWord = await linkedListService.insertWordAtPosition({
       text: text.trim(),
-      position: position,
       author: req.user.userId,
       authorName: req.user.username
-    });
-    
-    await word.save();
+    }, position);
     
     // Update user's word count
     const user = await User.findById(req.user.userId);
     user.wordsWritten += 1;
     
-    // Only give delete credits to non-admin users
     if (user.username !== 'admin') {
       if (user.wordsWritten % 3 === 0) {
         user.deleteCredits += 2;
@@ -77,8 +61,7 @@ router.post('/words', authenticateToken, async (req, res) => {
     
     await user.save();
     
-    // Return the updated word
-    res.status(201).json(word);
+    res.status(201).json(newWord);
   } catch (error) {
     console.error('Add word error:', error);
     res.status(500).json({ message: 'Error adding word', error: error.message });
@@ -208,14 +191,15 @@ router.get('/words/:wordId/like-status', authenticateToken, async (req, res) => 
 });
 
 // Update the DELETE endpoint for words
+// Delete word by position using linked list
 router.delete('/words/:position', authenticateToken, async (req, res) => {
   try {
     const user = await User.findById(req.user.userId);
-    
-    // Check if user is admin (unlimited credits)
     const isAdmin = user.username === 'admin';
+    const position = parseInt(req.params.position);
     
-    const word = await Word.findOne({ position: parseInt(req.params.position) });
+    // Get the word to check ownership and likes
+    const word = await linkedListService.getWordByOrder(position);
     if (!word) {
       return res.status(404).json({ message: 'Word not found' });
     }
@@ -242,19 +226,13 @@ router.delete('/words/:position', authenticateToken, async (req, res) => {
       });
     }
     
-    await word.deleteOne();
+    // Delete using linked list
+    await linkedListService.deleteWordAtPosition(position);
     
     // Update user's delete credits (only for non-admin)
     if (!isAdmin) {
       user.deleteCredits -= deletionCost;
       await user.save();
-    }
-    
-    // Reorder remaining words
-    const remainingWords = await Word.find({ position: { $gt: word.position } }).sort('position');
-    for (let i = 0; i < remainingWords.length; i++) {
-      remainingWords[i].position -= 1;
-      await remainingWords[i].save();
     }
     
     res.json({ 
@@ -295,6 +273,29 @@ router.get('/words/:wordId/deletion-cost', authenticateToken, async (req, res) =
   } catch (error) {
     console.error('Error getting deletion cost:', error);
     res.status(500).json({ message: 'Error getting deletion cost', error: error.message });
+  }
+});
+
+// Get word count (efficient)
+router.get('/word-count', async (req, res) => {
+  try {
+    const count = await linkedListService.getWordCount();
+    res.json({ count });
+  } catch (error) {
+    res.status(500).json({ message: 'Error getting word count', error: error.message });
+  }
+});
+
+// Get paginated words
+router.get('/words/range', async (req, res) => {
+  try {
+    const start = parseInt(req.query.start) || 0;
+    const limit = parseInt(req.query.limit) || 100;
+    
+    const words = await linkedListService.getWordRange(start, limit);
+    res.json(words);
+  } catch (error) {
+    res.status(500).json({ message: 'Error fetching word range', error: error.message });
   }
 });
 

@@ -3,7 +3,7 @@ VibeCoding Context Export
 ================================================================================
 Root directory: /workspaces/CommunalBook
 Style tag stripping: ON
-Total files: 19
+Total files: 23
 ================================================================================
 
 
@@ -36,6 +36,35 @@ export const authenticateToken = (req, res, next) => {
     next();
   });
 };
+
+
+================================================================================
+FILE: backend/models/Stats.js
+================================================================================
+
+// backend/models/Stats.js
+import mongoose from 'mongoose';
+
+const statsSchema = new mongoose.Schema({
+  averageLikes: {
+    type: Number,
+    default: 0
+  },
+  stdDeviation: {
+    type: Number,
+    default: 0
+  },
+  totalWords: {
+    type: Number,
+    default: 0
+  },
+  lastCalculated: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+export default mongoose.model('Stats', statsSchema);
 
 
 ================================================================================
@@ -112,9 +141,21 @@ const wordSchema = new mongoose.Schema({
     type: String,
     required: true
   },
-  position: {
+  // Linked list pointers
+  nextWord: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Word',
+    default: null
+  },
+  prevWord: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Word',
+    default: null
+  },
+  // For quick ordering without traversing entire list
+  order: {
     type: Number,
-    required: true
+    index: true  // For sorting when needed
   },
   author: {
     type: mongoose.Schema.Types.ObjectId,
@@ -138,6 +179,9 @@ const wordSchema = new mongoose.Schema({
     default: Date.now
   }
 });
+
+// Add index for faster queries
+wordSchema.index({ order: 1 });
 
 export default mongoose.model('Word', wordSchema);
 
@@ -228,23 +272,21 @@ FILE: backend/routes/book.js
 ================================================================================
 
 // routes/book.js
-
+// routes/book.js
 import express from 'express';
 import Word from '../models/Word.js';
 import User from '../models/User.js';
 import { authenticateToken } from '../middleware/auth.js';
+import Stats from '../models/Stats.js';
+import { getDeletionCost } from '../utils/statsCalculator.js';
+import linkedListService from '../services/linkedListService.js';
 
 const router = express.Router();
 
-// Test route
-router.get('/test', (req, res) => {
-  res.json({ message: 'Book routes working' });
-});
-
-// Get all words
+// Get all words (now using linked list)
 router.get('/words', async (req, res) => {
   try {
-    const words = await Word.find().sort('position');
+    const words = await linkedListService.getBookInOrder();
     res.json(words);
   } catch (error) {
     res.status(500).json({ message: 'Error fetching words', error: error.message });
@@ -253,7 +295,7 @@ router.get('/words', async (req, res) => {
 
 // Add a word (requires auth)
 // routes/book.js - Complete updated POST endpoint
-
+// Add a word using linked list
 router.post('/words', authenticateToken, async (req, res) => {
   try {
     const { text, insertAtPosition } = req.body;
@@ -263,35 +305,25 @@ router.post('/words', authenticateToken, async (req, res) => {
     }
     
     let position;
-    let wordCount = await Word.countDocuments();
+    const wordCount = await linkedListService.getWordCount();
     
-    // Check if we're inserting at a specific position
+    // Determine insertion position
     if (insertAtPosition !== undefined && insertAtPosition !== null && insertAtPosition <= wordCount) {
-      // Inserting in the middle - shift all words from this position right
       position = insertAtPosition;
-      await Word.updateMany(
-        { position: { $gte: insertAtPosition } },
-        { $inc: { position: 1 } }
-      );
     } else {
-      // Append to end (default behavior)
-      position = wordCount;
+      position = wordCount; // Append to end
     }
     
-    const word = new Word({
+    const newWord = await linkedListService.insertWordAtPosition({
       text: text.trim(),
-      position: position,
       author: req.user.userId,
       authorName: req.user.username
-    });
-    
-    await word.save();
+    }, position);
     
     // Update user's word count
     const user = await User.findById(req.user.userId);
     user.wordsWritten += 1;
     
-    // Only give delete credits to non-admin users
     if (user.username !== 'admin') {
       if (user.wordsWritten % 3 === 0) {
         user.deleteCredits += 2;
@@ -302,58 +334,10 @@ router.post('/words', authenticateToken, async (req, res) => {
     
     await user.save();
     
-    // Return the updated word
-    res.status(201).json(word);
+    res.status(201).json(newWord);
   } catch (error) {
     console.error('Add word error:', error);
     res.status(500).json({ message: 'Error adding word', error: error.message });
-  }
-});
-
-// Delete a word (requires auth)
-router.delete('/words/:position', authenticateToken, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.userId);
-    
-    // Check if user is admin (unlimited credits)
-    const isAdmin = user.username === 'admin';
-    
-    if (!isAdmin && user.deleteCredits <= 0) {
-      return res.status(403).json({ message: 'No delete credits available' });
-    }
-    
-    const word = await Word.findOne({ position: parseInt(req.params.position) });
-    if (!word) {
-      return res.status(404).json({ message: 'Word not found' });
-    }
-    
-    // Don't allow deleting own words for non-admin users
-    if (!isAdmin && word.author.toString() === req.user.userId) {
-      return res.status(403).json({ message: 'Cannot delete your own words' });
-    }
-    
-    await word.deleteOne();
-    
-    // Update user's delete credits (only for non-admin)
-    if (!isAdmin) {
-      user.deleteCredits -= 1;
-      await user.save();
-    }
-    
-    // Reorder remaining words
-    const remainingWords = await Word.find({ position: { $gt: word.position } }).sort('position');
-    for (let i = 0; i < remainingWords.length; i++) {
-      remainingWords[i].position -= 1;
-      await remainingWords[i].save();
-    }
-    
-    res.json({ 
-      message: 'Word deleted successfully', 
-      remainingCredits: isAdmin ? 'unlimited' : user.deleteCredits 
-    });
-  } catch (error) {
-    console.error('Delete word error:', error);
-    res.status(500).json({ message: 'Error deleting word', error: error.message });
   }
 });
 
@@ -479,6 +463,115 @@ router.get('/words/:wordId/like-status', authenticateToken, async (req, res) => 
   }
 });
 
+// Update the DELETE endpoint for words
+// Delete word by position using linked list
+router.delete('/words/:position', authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId);
+    const isAdmin = user.username === 'admin';
+    const position = parseInt(req.params.position);
+    
+    // Get the word to check ownership and likes
+    const word = await linkedListService.getWordByOrder(position);
+    if (!word) {
+      return res.status(404).json({ message: 'Word not found' });
+    }
+    
+    // Don't allow deleting own words for non-admin users
+    if (!isAdmin && word.author.toString() === req.user.userId) {
+      return res.status(403).json({ message: 'Cannot delete your own words' });
+    }
+    
+    // Get latest stats for cost calculation
+    const stats = await Stats.findOne();
+    let deletionCost = 1;
+    
+    if (stats && !isAdmin) {
+      deletionCost = getDeletionCost(word.likes, stats.averageLikes, stats.stdDeviation);
+    }
+    
+    // Check if user has enough credits (non-admin only)
+    if (!isAdmin && user.deleteCredits < deletionCost) {
+      return res.status(403).json({ 
+        message: `Not enough credits. This word costs ${deletionCost} credit(s) to delete. You have ${user.deleteCredits} credits.`,
+        requiredCredits: deletionCost,
+        availableCredits: user.deleteCredits
+      });
+    }
+    
+    // Delete using linked list
+    await linkedListService.deleteWordAtPosition(position);
+    
+    // Update user's delete credits (only for non-admin)
+    if (!isAdmin) {
+      user.deleteCredits -= deletionCost;
+      await user.save();
+    }
+    
+    res.json({ 
+      message: 'Word deleted successfully', 
+      remainingCredits: isAdmin ? 'unlimited' : user.deleteCredits,
+      cost: deletionCost
+    });
+  } catch (error) {
+    console.error('Delete word error:', error);
+    res.status(500).json({ message: 'Error deleting word', error: error.message });
+  }
+});
+
+// Add endpoint to get deletion cost for a word
+router.get('/words/:wordId/deletion-cost', authenticateToken, async (req, res) => {
+  try {
+    const word = await Word.findById(req.params.wordId);
+    if (!word) {
+      return res.status(404).json({ message: 'Word not found' });
+    }
+    
+    const stats = await Stats.findOne();
+    let deletionCost = 1;
+    let deviation = 0;
+    
+    if (stats) {
+      deletionCost = getDeletionCost(word.likes, stats.averageLikes, stats.stdDeviation);
+      deviation = stats.stdDeviation === 0 ? 0 : (word.likes - stats.averageLikes) / stats.stdDeviation;
+    }
+    
+    res.json({
+      cost: deletionCost,
+      likes: word.likes,
+      averageLikes: stats?.averageLikes || 0,
+      stdDeviation: stats?.stdDeviation || 0,
+      deviations: deviation
+    });
+  } catch (error) {
+    console.error('Error getting deletion cost:', error);
+    res.status(500).json({ message: 'Error getting deletion cost', error: error.message });
+  }
+});
+
+// Get word count (efficient)
+router.get('/word-count', async (req, res) => {
+  try {
+    const count = await linkedListService.getWordCount();
+    res.json({ count });
+  } catch (error) {
+    res.status(500).json({ message: 'Error getting word count', error: error.message });
+  }
+});
+
+// Get paginated words
+router.get('/words/range', async (req, res) => {
+  try {
+    const start = parseInt(req.query.start) || 0;
+    const limit = parseInt(req.query.limit) || 100;
+    
+    const words = await linkedListService.getWordRange(start, limit);
+    res.json(words);
+  } catch (error) {
+    res.status(500).json({ message: 'Error fetching word range', error: error.message });
+  }
+});
+
 export default router;
 
 
@@ -494,6 +587,19 @@ import { Server } from 'socket.io';
 import http from 'http';
 import authRoutes from './routes/auth.js';
 import bookRoutes from './routes/book.js';
+// backend/server.js - Add stats calculation scheduler
+import cron from 'node-cron';
+import { calculateLikeStats } from './utils/statsCalculator.js';
+
+// Add this after MongoDB connection
+// Calculate stats on server startup
+calculateLikeStats();
+
+// Schedule stats calculation every 5 minutes
+cron.schedule('*/5 * * * *', () => {
+  console.log('🔄 Running scheduled like stats calculation...');
+  calculateLikeStats();
+});
 
 dotenv.config();
 
@@ -586,6 +692,323 @@ server.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
   console.log(`📡 WebSocket server ready for connections`);
 });
+
+
+================================================================================
+FILE: backend/services/linkedListService.js
+================================================================================
+
+import Word from '../models/Word.js';
+
+class LinkedListService {
+  // Get the first word (head)
+  async getHead() {
+    return await Word.findOne({ prevWord: null }).populate('author', 'username');
+  }
+
+  // Get the last word (tail)
+  async getTail() {
+    return await Word.findOne({ nextWord: null }).populate('author', 'username');
+  }
+
+  // Get entire book in order
+  async getBookInOrder() {
+    const allWords = await Word.find().lean();
+    const wordMap = new Map();
+    allWords.forEach(word => wordMap.set(word._id.toString(), word));
+    
+    const orderedWords = [];
+    let current = await this.getHead();
+    let maxIterations = 10000; // Safety limit
+    let iterations = 0;
+    
+    while (current && iterations < maxIterations) {
+      orderedWords.push(current);
+      if (current.nextWord) {
+        current = wordMap.get(current.nextWord.toString());
+      } else {
+        current = null;
+      }
+      iterations++;
+    }
+    
+    return orderedWords;
+  }
+
+  // Insert word at specific position (without transactions)
+  async insertWordAtPosition(wordData, position) {
+    try {
+      const newWord = new Word(wordData);
+      
+      if (position === 0) {
+        // Insert at beginning
+        const oldHead = await this.getHead();
+        newWord.nextWord = oldHead ? oldHead._id : null;
+        newWord.prevWord = null;
+        
+        if (oldHead) {
+          oldHead.prevWord = newWord._id;
+          await oldHead.save();
+        }
+        
+        await newWord.save();
+      } else {
+        // Insert at position or end
+        const prevWord = await this.getWordByOrder(position - 1);
+        
+        if (prevWord) {
+          newWord.prevWord = prevWord._id;
+          newWord.nextWord = prevWord.nextWord;
+          
+          // Update next word's prev pointer
+          if (prevWord.nextWord) {
+            const nextWord = await Word.findById(prevWord.nextWord);
+            if (nextWord) {
+              nextWord.prevWord = newWord._id;
+              await nextWord.save();
+            }
+          }
+          
+          prevWord.nextWord = newWord._id;
+          await prevWord.save();
+        } else {
+          // Append to end
+          const tail = await this.getTail();
+          if (tail) {
+            newWord.prevWord = tail._id;
+            tail.nextWord = newWord._id;
+            await tail.save();
+          }
+          newWord.nextWord = null;
+        }
+        
+        await newWord.save();
+      }
+      
+      // Update order numbers asynchronously (don't wait)
+      this.recalculateOrders().catch(console.error);
+      
+      return newWord;
+    } catch (error) {
+      console.error('Error inserting word:', error);
+      throw error;
+    }
+  }
+
+  // Delete word at position (without transactions)
+  async deleteWordAtPosition(position) {
+    try {
+      const wordToDelete = await this.getWordByOrder(position);
+      if (!wordToDelete) {
+        throw new Error('Word not found');
+      }
+      
+      // Connect previous and next words
+      if (wordToDelete.prevWord) {
+        const prevWord = await Word.findById(wordToDelete.prevWord);
+        if (prevWord) {
+          prevWord.nextWord = wordToDelete.nextWord;
+          await prevWord.save();
+        }
+      }
+      
+      if (wordToDelete.nextWord) {
+        const nextWord = await Word.findById(wordToDelete.nextWord);
+        if (nextWord) {
+          nextWord.prevWord = wordToDelete.prevWord;
+          await nextWord.save();
+        }
+      }
+      
+      await wordToDelete.deleteOne();
+      
+      // Update order numbers asynchronously
+      this.recalculateOrders().catch(console.error);
+      
+      return true;
+    } catch (error) {
+      console.error('Error deleting word:', error);
+      throw error;
+    }
+  }
+
+  // Get word by order (using cached order field or traversal)
+  async getWordByOrder(targetOrder) {
+    // First try using cached order field
+    const wordWithOrder = await Word.findOne({ order: targetOrder });
+    if (wordWithOrder) return wordWithOrder;
+    
+    // Fallback to traversal
+    let current = await this.getHead();
+    let currentOrder = 0;
+    
+    while (current) {
+      if (currentOrder === targetOrder) {
+        return current;
+      }
+      current = current.nextWord ? await Word.findById(current.nextWord) : null;
+      currentOrder++;
+    }
+    
+    return null;
+  }
+
+  // Recalculate order numbers for caching
+  async recalculateOrders() {
+    let current = await this.getHead();
+    let order = 0;
+    let updates = [];
+    
+    while (current) {
+      if (current.order !== order) {
+        current.order = order;
+        updates.push(current.save());
+      }
+      current = current.nextWord ? await Word.findById(current.nextWord) : null;
+      order++;
+    }
+    
+    await Promise.all(updates);
+    console.log(`✅ Recalculated orders for ${order} words`);
+  }
+
+  // Get word count efficiently
+  async getWordCount() {
+    return await Word.countDocuments();
+  }
+
+  // Get range of words (for pagination)
+  async getWordRange(startPosition, count) {
+    const startWord = await this.getWordByOrder(startPosition);
+    if (!startWord) return [];
+    
+    const words = [];
+    let current = startWord;
+    let fetched = 0;
+    let maxIterations = count * 2; // Safety limit
+    
+    while (current && fetched < count && fetched < maxIterations) {
+      words.push(current);
+      current = current.nextWord ? await Word.findById(current.nextWord) : null;
+      fetched++;
+    }
+    
+    return words;
+  }
+
+  // Get word by ID with its order
+  async getWordWithOrder(wordId) {
+    const word = await Word.findById(wordId);
+    if (!word) return null;
+    
+    if (word.order !== undefined && word.order !== null) {
+      return word;
+    }
+    
+    // Calculate order if not cached
+    let current = await this.getHead();
+    let order = 0;
+    
+    while (current) {
+      if (current._id.toString() === wordId) {
+        word.order = order;
+        await word.save();
+        return word;
+      }
+      current = current.nextWord ? await Word.findById(current.nextWord) : null;
+      order++;
+    }
+    
+    return null;
+  }
+}
+
+export default new LinkedListService();
+
+
+================================================================================
+FILE: backend/utils/orderRecalculator.js
+================================================================================
+
+import cron from 'node-cron';
+import linkedListService from '../services/linkedListService.js';
+
+// Recalculate order numbers periodically (every hour)
+cron.schedule('0 * * * *', async () => {
+  console.log('🔄 Recalculating word order numbers...');
+  try {
+    await linkedListService.recalculateOrders();
+    console.log('✅ Word order numbers updated');
+  } catch (error) {
+    console.error('❌ Error recalculating order numbers:', error);
+  }
+});
+
+
+================================================================================
+FILE: backend/utils/statsCalculator.js
+================================================================================
+
+// backend/utils/statsCalculator.js
+import Word from '../models/Word.js';
+import Stats from '../models/Stats.js';
+
+export const calculateLikeStats = async () => {
+  try {
+    const words = await Word.find({}, 'likes');
+    
+    if (words.length === 0) {
+      // No words, set default stats
+      await Stats.findOneAndUpdate(
+        {},
+        {
+          averageLikes: 0,
+          stdDeviation: 0,
+          totalWords: 0,
+          lastCalculated: new Date()
+        },
+        { upsert: true, new: true }
+      );
+      return;
+    }
+    
+    // Calculate average
+    const totalLikes = words.reduce((sum, word) => sum + word.likes, 0);
+    const average = totalLikes / words.length;
+    
+    // Calculate standard deviation
+    const squaredDiffs = words.map(word => Math.pow(word.likes - average, 2));
+    const variance = squaredDiffs.reduce((sum, diff) => sum + diff, 0) / words.length;
+    const stdDev = Math.sqrt(variance);
+    
+    // Update stats
+    await Stats.findOneAndUpdate(
+      {},
+      {
+        averageLikes: average,
+        stdDeviation: stdDev,
+        totalWords: words.length,
+        lastCalculated: new Date()
+      },
+      { upsert: true, new: true }
+    );
+    
+    console.log(`📊 Stats updated: avg=${average.toFixed(2)}, stdDev=${stdDev.toFixed(2)}, words=${words.length}`);
+  } catch (error) {
+    console.error('Error calculating like stats:', error);
+  }
+};
+
+export const getDeletionCost = (likes, average, stdDev) => {
+  if (stdDev === 0) return 1; // No variation, base cost
+  
+  const deviations = (likes - average) / stdDev;
+  
+  if (deviations >= 3) return 1000;
+  if (deviations >= 2) return 100;
+  if (deviations >= 1) return 10;
+  return 1;
+};
 
 
 ================================================================================
@@ -1024,19 +1447,16 @@ export const useBookStore = defineStore('book', {
   },
   
   actions: {
-    async fetchWords() {
-      this.loading = true
-      try {
-        const response = await axios.get('/api/book/words')
-        this.words = response.data
-        this.error = null
-      } catch (error) {
-        this.error = 'Failed to load the book'
-        console.error(error)
-      } finally {
-        this.loading = false
-      }
-    },
+// frontend/src/stores/book.js - Add method to get deletion cost
+async getDeletionCost(wordId) {
+  try {
+    const response = await axios.get(`/api/book/words/${wordId}/deletion-cost`);
+    return response.data;
+  } catch (error) {
+    console.error('Error getting deletion cost:', error);
+    return { cost: 1, likes: 0 };
+  }
+},
     
 // stores/book.js
 // stores/book.js
@@ -1163,7 +1583,7 @@ async fetchWords() {
 FILE: frontend/src/views/Book.vue
 ================================================================================
 
-[STRIPPED: 6539 bytes of style content]
+[STRIPPED: 7169 bytes of style content]
 
 <template>
   <div class="book-container">
@@ -1257,21 +1677,32 @@ FILE: frontend/src/views/Book.vue
               
               <!-- Regular word -->
 <!-- Regular word -->
-<span
-  class="word"
-  :class="{ 
-    'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
-    'own-word': word.author === authStore.currentUser?.id
-  }"
-  @click="handleWordClick($event, word)"
-  @mouseenter="showTooltip($event, word)"
-  @mouseleave="hideTooltip"
->
-  {{ word.text }}
-  <span class="like-button" @click.stop="toggleLike(word)">
-    {{ word.userLiked ? '❤️' : '🤍' }}
+  <!-- Update the word span to show deletion cost -->
+  <span
+    class="word"
+    :class="{ 
+      'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
+      'own-word': word.author === authStore.currentUser?.id,
+      'high-cost': deleteMode && word.deletionCost && word.deletionCost >= 100,
+      'medium-cost': deleteMode && word.deletionCost && word.deletionCost >= 10 && word.deletionCost < 100
+    }"
+    @click="handleWordClick($event, word)"
+    @mouseenter="showTooltip($event, word)"
+    @mouseleave="hideTooltip"
+  >
+    {{ word.text }}
+    <span class="like-button" @click.stop="toggleLike(word)">
+      {{ word.userLiked ? '❤️' : '🤍' }}
+    </span>
+    <span v-if="deleteMode && word.deletionCost && !isAdmin && word.author !== authStore.currentUser?.id" 
+          class="delete-cost"
+          :class="{
+            'cost-high': word.deletionCost >= 100,
+            'cost-medium': word.deletionCost >= 10 && word.deletionCost < 100
+          }">
+      {{ word.deletionCost }}
+    </span>
   </span>
-</span>
               
               <!-- Insert indicator between words -->
         <!-- And for the between indicator -->
@@ -1455,15 +1886,6 @@ const handleFallbackCancel = () => {
   console.log('Fallback input cancelled')
 }
 
-const enableDeleteMode = () => {
-  if (isAdmin.value || authStore.deleteCredits > 0) {
-    deleteMode.value = true
-    showMessage('Delete mode activated!', 'info')
-  } else {
-    showMessage('No delete credits available!', 'error')
-  }
-}
-
 const cancelDeleteMode = () => {
   deleteMode.value = false
   showMessage('Delete mode deactivated', 'info')
@@ -1498,6 +1920,7 @@ const deleteAllWords = async () => {
   }
 }
 
+// Update handleWordClick to show cost in confirmation
 const handleWordClick = async (event, word) => {
   if (!deleteMode.value) return
   
@@ -1509,13 +1932,21 @@ const handleWordClick = async (event, word) => {
     return
   }
   
-  if (!isAdmin.value && authStore.deleteCredits === 0) {
-    showMessage("No delete credits available!", 'error')
-    deleteMode.value = false
+  // Get cost if not already fetched
+  let cost = word.deletionCost;
+  if (!cost && !isAdmin.value) {
+    const costInfo = await bookStore.getDeletionCost(word._id);
+    cost = costInfo.cost;
+    word.deletionCost = cost;
+  }
+  
+  if (!isAdmin.value && authStore.deleteCredits < cost) {
+    showMessage(`Not enough credits! This word costs ${cost} credit(s) to delete. You have ${authStore.deleteCredits} credits.`, 'error')
     return
   }
   
-  if (confirm(`Delete "${word.text}"?`)) {
+  const costMessage = !isAdmin.value ? ` This will cost ${cost} credit(s).` : '';
+  if (confirm(`Delete "${word.text}"?${costMessage}`)) {
     saving.value = true
     
     const result = await bookStore.deleteWord(word.position)
@@ -1523,38 +1954,85 @@ const handleWordClick = async (event, word) => {
     saving.value = false
     
     if (result.success) {
-      showMessage(`"${word.text}" deleted!`, 'success')
+      showMessage(`"${word.text}" deleted! Cost: ${cost} credit(s)`, 'success')
       if (!isAdmin.value) {
         await authStore.fetchUserStats()
         if (authStore.deleteCredits === 0) {
           deleteMode.value = false
         }
       }
+      // Refresh deletion costs for remaining words
+      await updateDeletionCosts()
     } else {
       showMessage(result.message, 'error')
     }
   }
 }
 
-const showTooltip = (event, word) => {
-  const tooltip = document.createElement('div')
-  tooltip.className = 'word-tooltip'
-  tooltip.innerHTML = `
+// Update the fetchWords logic to include deletion costs when in delete mode
+const updateDeletionCosts = async () => {
+  if (deleteMode.value && !isAdmin.value) {
+    for (const word of bookStore.words) {
+      if (word.author !== authStore.currentUser?.id) {
+        const costInfo = await bookStore.getDeletionCost(word._id);
+        word.deletionCost = costInfo.cost;
+        word.deviations = costInfo.deviations;
+      } else {
+        word.deletionCost = 0; // Can't delete own words
+      }
+    }
+  }
+};
+
+// Update showTooltip to include deletion cost info
+const showTooltip = async (event, word) => {
+  let tooltipContent = `
     ✍️ Written by: ${word.authorName}<br>
     ❤️ Likes: ${word.likes || 0}
-  `
+  `;
+  
+  // Add deletion cost info if in delete mode and not admin
+  if (deleteMode.value && !isAdmin.value && word.author !== authStore.currentUser?.id) {
+    let costInfo = word.deletionCost;
+    if (!costInfo) {
+      costInfo = await bookStore.getDeletionCost(word._id);
+      word.deletionCost = costInfo.cost;
+      word.deviations = costInfo.deviations;
+    }
+
+    tooltipContent += `<br>💸 Deletion cost: ${costInfo} credit(s)`;
+    if (costInfo.deviations >= 1) {
+      tooltipContent += `<br>📊 ${costInfo.deviations.toFixed(1)} std dev above average`;
+    }
+  }
+  
+  const tooltip = document.createElement('div')
+  tooltip.className = 'word-tooltip'
+  tooltip.innerHTML = tooltipContent
   tooltip.style.position = 'absolute'
   tooltip.style.left = `${event.clientX + 10}px`
   tooltip.style.top = `${event.clientY - 30}px`
   tooltip.style.backgroundColor = '#2d3748'
   tooltip.style.color = 'white'
-  tooltip.style.padding = '4px 8px'
+  tooltip.style.padding = '8px 12px'
   tooltip.style.borderRadius = '4px'
   tooltip.style.fontSize = '12px'
   tooltip.style.pointerEvents = 'none'
   tooltip.style.zIndex = '1000'
+  tooltip.style.whiteSpace = 'nowrap'
   document.body.appendChild(tooltip)
   event.target._tooltip = tooltip
+}
+
+// Update enableDeleteMode to fetch costs
+const enableDeleteMode = () => {
+  if (isAdmin.value || authStore.deleteCredits > 0) {
+    deleteMode.value = true
+    updateDeletionCosts()
+    showMessage('Delete mode activated! Click on any word (not yours) to delete it', 'info')
+  } else {
+    showMessage('No delete credits available!', 'error')
+  }
 }
 
 const hideTooltip = (event) => {
@@ -1623,6 +2101,13 @@ onUnmounted(() => {
   // Clean up socket listeners
   socket.off('word-update')
   socket.off('word-deleted')
+})
+
+// Watch deleteMode to refresh costs when entering delete mode
+watch(deleteMode, (newVal) => {
+  if (newVal && !isAdmin.value) {
+    updateDeletionCosts()
+  }
 })
 </script>
 
@@ -1848,6 +2333,6 @@ const handleRegister = async () => {
 STRIPPING STATISTICS
 ================================================================================
 Files with stripped styles: 7
-Total bytes stripped: 14,640
-Total stripped: 14.30 KB
+Total bytes stripped: 15,270
+Total stripped: 14.91 KB
 ================================================================================

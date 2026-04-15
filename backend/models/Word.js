@@ -5,9 +5,21 @@ const wordSchema = new mongoose.Schema({
     type: String,
     required: true
   },
-  position: {
+  // Linked list pointers
+  nextWord: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Word',
+    default: null
+  },
+  prevWord: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Word',
+    default: null
+  },
+  // For quick ordering without traversing entire list
+  order: {
     type: Number,
-    required: true
+    index: true  // For sorting when needed
   },
   author: {
     type: mongoose.Schema.Types.ObjectId,
@@ -31,5 +43,8 @@ const wordSchema = new mongoose.Schema({
     default: Date.now
   }
 });
+
+// Add index for faster queries
+wordSchema.index({ order: 1 });
 
 export default mongoose.model('Word', wordSchema);

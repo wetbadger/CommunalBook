@@ -120,10 +120,12 @@ async checkLikeStatus(wordId) {
 },
 
 // Modify fetchWords to include user like status
+// frontend/src/stores/book.js
 async fetchWords() {
   this.loading = true
   try {
     const response = await axios.get('/api/book/words')
+    // The backend now includes position in each word object
     this.words = response.data
     
     // If user is authenticated, check like status for each word
