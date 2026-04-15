@@ -17,15 +17,15 @@ const router = createRouter({
   routes
 })
 
-router.beforeEach((to, from, next) => {
+router.beforeEach((to, from) => {
   const authStore = useAuthStore()
   
   if (to.meta.requiresAuth && !authStore.isAuthenticated) {
-    next('/login')
+    return '/login'
   } else if (to.meta.requiresGuest && authStore.isAuthenticated) {
-    next('/book')
+    return '/book'
   } else {
-    next()
+    return true
   }
 })
 

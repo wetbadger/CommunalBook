@@ -119,7 +119,7 @@ const handleKeydown = async (event) => {
 }
 
 const handleBlur = () => {
-  console.log('Input blurred')
+  //console.log('Input blurred')
 }
 
 const handlePaste = (event) => {
