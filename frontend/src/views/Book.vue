@@ -185,8 +185,8 @@ import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import { useBookStore } from '../stores/book'
-import WordInput from '../components/WordInput.vue'
 import { io } from 'socket.io-client'
+import WordInput from '../components/WordInput.vue'
 
 const socket = io('http://localhost:3000')
 const router = useRouter()
@@ -216,9 +216,6 @@ const showMessage = (text, type = 'info') => {
 }
 
 const activateInsertAt = (position) => {
-  console.log('activateInsertAt called with position:', position)
-  console.log('Current deleteMode:', deleteMode.value)
-  
   if (deleteMode.value) {
     showMessage('Please exit delete mode first', 'error')
     return
@@ -231,23 +228,19 @@ const activateInsertAt = (position) => {
   }
   
   activeInsertPosition.value = position
-  console.log('activeInsertPosition set to:', position)
   showMessage(`Insert mode active at position ${position}. Type your word.`, 'info')
 }
 
 const cancelInlineInsert = () => {
-  console.log('cancelInlineInsert called, current position:', activeInsertPosition.value)
   activeInsertPosition.value = null
   showMessage('Insert mode cancelled', 'info')
 }
 
 const cancelInsertMode = () => {
-  console.log('cancelInsertMode called from toolbar')
   cancelInlineInsert()
 }
 
 const handleWordSubmit = async ({ text, position }) => {
-  console.log('handleWordSubmit called with:', { text, position })
   saving.value = true
   
   const result = await bookStore.addWord(text, position)
@@ -267,7 +260,6 @@ const handleWordSubmit = async ({ text, position }) => {
       if (nextPosition <= bookStore.wordCount) {
         // Keep the insert mode active at the next position
         activeInsertPosition.value = nextPosition
-        console.log(`Keeping insert mode active at position ${nextPosition}`)
         showMessage(`Added "${text}"! Keep typing...`, 'success')
       } else {
         // If we're at the end, you could either:
