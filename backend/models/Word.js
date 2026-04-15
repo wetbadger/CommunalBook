@@ -18,6 +18,14 @@ const wordSchema = new mongoose.Schema({
     type: String,
     required: true
   },
+  likes: {
+    type: Number,
+    default: 0
+  },
+  likedBy: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  }],
   createdAt: {
     type: Date,
     default: Date.now

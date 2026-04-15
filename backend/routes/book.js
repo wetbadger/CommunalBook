@@ -168,4 +168,86 @@ router.get('/user-stats', authenticateToken, async (req, res) => {
   }
 });
 
+// Like a word
+router.post('/words/:wordId/like', authenticateToken, async (req, res) => {
+  try {
+    const word = await Word.findById(req.params.wordId);
+    
+    if (!word) {
+      return res.status(404).json({ message: 'Word not found' });
+    }
+    
+    // Check if user already liked this word
+    if (word.likedBy.includes(req.user.userId)) {
+      return res.status(400).json({ message: 'You already liked this word' });
+    }
+    
+    // Add like
+    word.likes += 1;
+    word.likedBy.push(req.user.userId);
+    await word.save();
+    
+    res.json({ 
+      message: 'Word liked successfully',
+      likes: word.likes,
+      liked: true
+    });
+  } catch (error) {
+    console.error('Like word error:', error);
+    res.status(500).json({ message: 'Error liking word', error: error.message });
+  }
+});
+
+// Unlike a word
+router.delete('/words/:wordId/like', authenticateToken, async (req, res) => {
+  try {
+    const word = await Word.findById(req.params.wordId);
+    
+    if (!word) {
+      return res.status(404).json({ message: 'Word not found' });
+    }
+    
+    // Check if user has liked this word
+    const likeIndex = word.likedBy.indexOf(req.user.userId);
+    if (likeIndex === -1) {
+      return res.status(400).json({ message: 'You haven\'t liked this word' });
+    }
+    
+    // Remove like
+    word.likes -= 1;
+    word.likedBy.splice(likeIndex, 1);
+    await word.save();
+    
+    res.json({ 
+      message: 'Like removed successfully',
+      likes: word.likes,
+      liked: false
+    });
+  } catch (error) {
+    console.error('Unlike word error:', error);
+    res.status(500).json({ message: 'Error unliking word', error: error.message });
+  }
+});
+
+// Check if user liked a specific word
+router.get('/words/:wordId/like-status', authenticateToken, async (req, res) => {
+  try {
+    const word = await Word.findById(req.params.wordId);
+    
+    if (!word) {
+      return res.status(404).json({ message: 'Word not found' });
+    }
+    
+    const liked = word.likedBy.includes(req.user.userId);
+    
+    res.json({ 
+      liked,
+      likes: word.likes
+    });
+  } catch (error) {
+    console.error('Check like status error:', error);
+    res.status(500).json({ message: 'Error checking like status', error: error.message });
+  }
+});
+
 export default router;

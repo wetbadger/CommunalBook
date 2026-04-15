@@ -89,18 +89,22 @@
               />
               
               <!-- Regular word -->
-              <span
-                class="word"
-                :class="{ 
-                  'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
-                  'own-word': word.author === authStore.currentUser?.id
-                }"
-                @click="handleWordClick($event, word)"
-                @mouseenter="showTooltip($event, word)"
-                @mouseleave="hideTooltip"
-              >
-                {{ word.text }}
-              </span>
+<!-- Regular word -->
+<span
+  class="word"
+  :class="{ 
+    'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
+    'own-word': word.author === authStore.currentUser?.id
+  }"
+  @click="handleWordClick($event, word)"
+  @mouseenter="showTooltip($event, word)"
+  @mouseleave="hideTooltip"
+>
+  {{ word.text }}
+  <span class="like-button" @click.stop="toggleLike(word)">
+    {{ word.userLiked ? '❤️' : '🤍' }}
+  </span>
+</span>
               
               <!-- Insert indicator between words -->
         <!-- And for the between indicator -->
@@ -368,7 +372,10 @@ const handleWordClick = async (event, word) => {
 const showTooltip = (event, word) => {
   const tooltip = document.createElement('div')
   tooltip.className = 'word-tooltip'
-  tooltip.textContent = `✍️ Written by: ${word.authorName}`
+  tooltip.innerHTML = `
+    ✍️ Written by: ${word.authorName}<br>
+    ❤️ Likes: ${word.likes || 0}
+  `
   tooltip.style.position = 'absolute'
   tooltip.style.left = `${event.clientX + 10}px`
   tooltip.style.top = `${event.clientY - 30}px`
@@ -386,6 +393,34 @@ const showTooltip = (event, word) => {
 const hideTooltip = (event) => {
   if (event.target._tooltip) {
     event.target._tooltip.remove()
+  }
+}
+
+const toggleLike = async (word) => {
+  if (!authStore.isAuthenticated) {
+    showMessage('Please login to like words', 'error')
+    return
+  }
+  
+  saving.value = true
+  
+  let result
+  if (word.userLiked) {
+    result = await bookStore.unlikeWord(word._id)
+    if (result.success) {
+      showMessage('Like removed', 'info')
+    }
+  } else {
+    result = await bookStore.likeWord(word._id)
+    if (result.success) {
+      showMessage('Word liked!', 'success')
+    }
+  }
+  
+  saving.value = false
+  
+  if (!result.success) {
+    showMessage(result.message, 'error')
   }
 }
 
@@ -825,5 +860,37 @@ onUnmounted(() => {
 .word.deletable:hover {
   background: #fc8181;
   transform: scale(1.02);
+}
+
+.word {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 4px;
+}
+
+.like-button {
+  cursor: pointer;
+  font-size: 14px;
+  opacity: 0.6;
+  transition: opacity 0.2s;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.like-button:hover {
+  opacity: 1;
+  transform: scale(1.1);
+}
+
+.like-count {
+  font-size: 11px;
+  color: #666;
+}
+
+.word:hover .like-button {
+  opacity: 1;
 }
 </style>

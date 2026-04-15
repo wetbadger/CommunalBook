@@ -47,7 +47,10 @@ const bookStore = useBookStore()
 const showTooltip = (event, word) => {
   const tooltip = document.createElement('div')
   tooltip.className = 'word-tooltip'
-  tooltip.textContent = `✍️ Written by: ${word.authorName}`
+  tooltip.innerHTML = `
+    ✍️ Written by: ${word.authorName}<br>
+    ❤️ Likes: ${word.likes || 0}
+  `
   tooltip.style.position = 'absolute'
   tooltip.style.left = `${event.clientX + 10}px`
   tooltip.style.top = `${event.clientY - 30}px`
