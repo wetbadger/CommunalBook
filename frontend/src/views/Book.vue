@@ -258,13 +258,30 @@ const handleWordSubmit = async ({ text, position }) => {
     await authStore.fetchUserStats()
     
     if (position !== null) {
-      // Inline insert
-      activeInsertPosition.value = null
-      console.log('Insert successful, cleared activeInsertPosition')
-      showMessage(`Added "${text}" at position ${position}!`, 'success')
+      // After inserting at position, move to the next position
+      // This keeps the input at the location where you just inserted
+      const nextPosition = position + 1
+      
+      // If there's a word after this position, we need to adjust
+      // because the words array has shifted
+      if (nextPosition <= bookStore.wordCount) {
+        // Keep the insert mode active at the next position
+        activeInsertPosition.value = nextPosition
+        console.log(`Keeping insert mode active at position ${nextPosition}`)
+        showMessage(`Added "${text}"! Keep typing...`, 'success')
+      } else {
+        // If we're at the end, you could either:
+        // Option 1: Keep at the end (still in insert mode)
+        activeInsertPosition.value = nextPosition
+        showMessage(`Added "${text}"! Keep typing at the end...`, 'success')
+        
+        // Option 2: Or cancel insert mode (uncomment if preferred)
+        // activeInsertPosition.value = null
+        // showMessage(`Added "${text}" at position ${position}!`, 'success')
+      }
     } else {
-      // Fallback append
-      showMessage(`Added "${text}"!`, 'success')
+      // Fallback append - keep the fallback input active
+      showMessage(`Added "${text}"! Keep typing...`, 'success')
     }
   } else {
     showMessage(result.message, 'error')
