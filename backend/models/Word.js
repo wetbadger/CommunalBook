@@ -7,8 +7,7 @@ const wordSchema = new mongoose.Schema({
   },
   position: {
     type: Number,
-    required: true,
-    unique: true
+    required: true
   },
   author: {
     type: mongoose.Schema.Types.ObjectId,

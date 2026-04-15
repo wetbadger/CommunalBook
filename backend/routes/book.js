@@ -23,18 +23,35 @@ router.get('/words', async (req, res) => {
 });
 
 // Add a word (requires auth)
+// routes/book.js - Complete updated POST endpoint
+
 router.post('/words', authenticateToken, async (req, res) => {
   try {
-    const { text } = req.body;
+    const { text, insertAtPosition } = req.body;
     
     if (!text || text.trim().split(/\s+/).length !== 1) {
       return res.status(400).json({ message: 'Only single words allowed' });
     }
     
-    const wordCount = await Word.countDocuments();
+    let position;
+    let wordCount = await Word.countDocuments();
+    
+    // Check if we're inserting at a specific position
+    if (insertAtPosition !== undefined && insertAtPosition !== null && insertAtPosition <= wordCount) {
+      // Inserting in the middle - shift all words from this position right
+      position = insertAtPosition;
+      await Word.updateMany(
+        { position: { $gte: insertAtPosition } },
+        { $inc: { position: 1 } }
+      );
+    } else {
+      // Append to end (default behavior)
+      position = wordCount;
+    }
+    
     const word = new Word({
       text: text.trim(),
-      position: wordCount,
+      position: position,
       author: req.user.userId,
       authorName: req.user.username
     });
@@ -47,17 +64,16 @@ router.post('/words', authenticateToken, async (req, res) => {
     
     // Only give delete credits to non-admin users
     if (user.username !== 'admin') {
-      // Every 3 words gives 2 delete credits
       if (user.wordsWritten % 3 === 0) {
         user.deleteCredits += 2;
       }
     } else {
-      // Admin gets unlimited credits (set to a high number)
       user.deleteCredits = 999999;
     }
     
     await user.save();
     
+    // Return the updated word
     res.status(201).json(word);
   } catch (error) {
     console.error('Add word error:', error);

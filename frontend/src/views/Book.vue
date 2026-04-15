@@ -1,5 +1,3 @@
-<!-- views/Book.vue -->
-
 <template>
   <div class="book-container">
     <header class="header">
@@ -7,7 +5,7 @@
         <h1>📖 Collaborative Book</h1>
         <div class="stats">
           <span>✍️ {{ authStore.wordsWritten }} words</span>
-          <span>🗑️ {{ authStore.deleteCredits }} credits</span>
+          <span>🗑️ {{ authStore.deleteCredits === 'unlimited' ? '∞' : authStore.deleteCredits }} credits</span>
         </div>
       </div>
       <div class="user-info">
@@ -23,7 +21,7 @@
           :class="{ active: deleteMode }"
           :disabled="!isAdmin && authStore.deleteCredits === 0"
         >
-          🗑️ Delete Mode ({{ authStore.deleteCredits }} credits)
+          🗑️ Delete Mode ({{ authStore.deleteCredits === 'unlimited' ? '∞' : authStore.deleteCredits }} credits)
         </button>
         <button v-if="deleteMode" @click="cancelDeleteMode" class="cancel-btn">
           Cancel Delete Mode
@@ -39,8 +37,15 @@
           ⚠️ Delete All Words
         </button>
         
+        <button v-if="activeInsertPosition !== null" @click="cancelInsertMode" class="cancel-btn">
+          Cancel Insert Mode
+        </button>
+        
         <div class="info" v-if="deleteMode">
           Click on any word (not yours) to delete it (costs 1 credit)
+        </div>
+        <div class="insert-info" v-if="activeInsertPosition !== null">
+          📍 Inserting at position {{ activeInsertPosition }}. Type your word and press Enter/Space
         </div>
         <div class="admin-info" v-if="isAdmin">
           🔧 Admin Mode: Unlimited delete credits
@@ -61,34 +66,85 @@
           ref="editorRef"
         >
           <div class="words-wrapper">
-            <span
-              v-for="word in bookStore.words"
-              :key="word.id"
-              :data-id="word.id"
-              :data-position="word.position"
-              :data-author-id="word.author"
-              :data-author-name="word.authorName"
-              class="word"
-              :class="{ 
-                'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
-                'own-word': word.author === authStore.currentUser?.id
-              }"
-              @click="handleWordClick($event, word)"
-              @mouseenter="showTooltip($event, word)"
-              @mouseleave="hideTooltip"
-            >
-              {{ word.text }}
-            </span>
-            <span class="word-separator"> </span>
+            <!-- Insert at beginning -->
             <span 
-              ref="inputSpanRef"
-              class="word own-word input-word"
-              contenteditable="true"
-              @input="handleInput"
-              @keydown="handleKeydown"
-              @paste="handlePaste"
-              @blur="handleBlur"
-            ></span>
+              v-if="!deleteMode && activeInsertPosition !== 0" 
+              class="insert-indicator insert-beginning"
+              @click.stop="activateInsertAt(0)"
+              title="Insert at beginning"
+            >
+              ⬅️ Insert here
+            </span>
+            
+            <template v-for="word in bookStore.words" :key="word.id">
+              <!-- Inline input component at specific position -->
+              <WordInput
+                v-if="activeInsertPosition === word.position"
+                mode="inline"
+                :insert-position="word.position"
+                :is-active="true"
+                :auto-focus="true"
+                @submit="handleWordSubmit"
+                @cancel="cancelInlineInsert"
+              />
+              
+              <!-- Regular word -->
+              <span
+                class="word"
+                :class="{ 
+                  'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
+                  'own-word': word.author === authStore.currentUser?.id
+                }"
+                @click="handleWordClick($event, word)"
+                @mouseenter="showTooltip($event, word)"
+                @mouseleave="hideTooltip"
+              >
+                {{ word.text }}
+              </span>
+              
+              <!-- Insert indicator between words -->
+        <!-- And for the between indicator -->
+        <span 
+          v-if="!deleteMode && activeInsertPosition !== word.position + 1" 
+          class="insert-indicator insert-between"
+          @click.stop="activateInsertAt(word.position + 1)"
+          :title="`Insert after '${word.text}'`"
+        >
+          ➕
+        </span>
+            </template>
+            
+            <!-- Inline input at the end -->
+            <WordInput
+              v-if="activeInsertPosition === bookStore.wordCount"
+              mode="inline"
+              :insert-position="bookStore.wordCount"
+              :is-active="true"
+              :auto-focus="true"
+              @submit="handleWordSubmit"
+              @cancel="cancelInlineInsert"
+            />
+            
+            <!-- Insert at end indicator -->
+            <span 
+              v-if="!deleteMode && activeInsertPosition !== bookStore.wordCount" 
+              class="insert-indicator insert-end"
+              @click.stop="activateInsertAt(bookStore.wordCount)"
+              title="Insert at end"
+            >
+              Insert here ➡️
+            </span>
+            
+            <!-- Fallback input component -->
+            <WordInput
+              v-if="activeInsertPosition === null"
+              ref="fallbackInput"
+              mode="fallback"
+              :is-active="true"
+              :auto-focus="true"
+              @submit="handleWordSubmit"
+              @cancel="handleFallbackCancel"
+            />
           </div>
         </div>
       </div>
@@ -125,33 +181,30 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, nextTick, watch, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import { useBookStore } from '../stores/book'
-import { io } from 'socket.io-client';
+import WordInput from '../components/WordInput.vue'
+import { io } from 'socket.io-client'
 
-const socket = io('http://localhost:3000');
-
+const socket = io('http://localhost:3000')
 const router = useRouter()
 const authStore = useAuthStore()
 const bookStore = useBookStore()
 
 const deleteMode = ref(false)
-const saving = ref(false)
+const activeInsertPosition = ref(null)
+const fallbackInput = ref(null)
 const message = ref('')
 const messageType = ref('info')
-const editorRef = ref(null)
-const inputSpanRef = ref(null)
-const activeUsers = ref(1)
 const showConfirmModal = ref(false)
+const activeUsers = ref(1)
+const saving = ref(false)
 let messageTimeout = null
 let isProcessingRemoteUpdate = false
 
-// Check if current user is admin
-const isAdmin = computed(() => {
-  return authStore.currentUser?.username === 'admin'
-})
+const isAdmin = computed(() => authStore.currentUser?.username === 'admin')
 
 const showMessage = (text, type = 'info') => {
   if (messageTimeout) clearTimeout(messageTimeout)
@@ -162,12 +215,72 @@ const showMessage = (text, type = 'info') => {
   }, 3000)
 }
 
+const activateInsertAt = (position) => {
+  console.log('activateInsertAt called with position:', position)
+  console.log('Current deleteMode:', deleteMode.value)
+  
+  if (deleteMode.value) {
+    showMessage('Please exit delete mode first', 'error')
+    return
+  }
+  
+  // Prevent if already active at same position
+  if (activeInsertPosition.value === position) {
+    console.log('Already active at this position')
+    return
+  }
+  
+  activeInsertPosition.value = position
+  console.log('activeInsertPosition set to:', position)
+  showMessage(`Insert mode active at position ${position}. Type your word.`, 'info')
+}
+
+const cancelInlineInsert = () => {
+  console.log('cancelInlineInsert called, current position:', activeInsertPosition.value)
+  activeInsertPosition.value = null
+  showMessage('Insert mode cancelled', 'info')
+}
+
+const cancelInsertMode = () => {
+  console.log('cancelInsertMode called from toolbar')
+  cancelInlineInsert()
+}
+
+const handleWordSubmit = async ({ text, position }) => {
+  console.log('handleWordSubmit called with:', { text, position })
+  saving.value = true
+  
+  const result = await bookStore.addWord(text, position)
+  
+  saving.value = false
+  
+  if (result.success) {
+    await authStore.fetchUserStats()
+    
+    if (position !== null) {
+      // Inline insert
+      activeInsertPosition.value = null
+      console.log('Insert successful, cleared activeInsertPosition')
+      showMessage(`Added "${text}" at position ${position}!`, 'success')
+    } else {
+      // Fallback append
+      showMessage(`Added "${text}"!`, 'success')
+    }
+  } else {
+    showMessage(result.message, 'error')
+  }
+}
+
+const handleFallbackCancel = () => {
+  console.log('Fallback input cancelled')
+}
+
 const enableDeleteMode = () => {
   if (isAdmin.value || authStore.deleteCredits > 0) {
     deleteMode.value = true
-    showMessage('Delete mode activated! Click on any word to delete it' + (isAdmin.value ? ' (Admin: No credit cost)' : ' (costs 1 credit)'), 'info')
+    showMessage('Delete mode activated!', 'info')
   } else {
-    showMessage('You need delete credits to use delete mode! Write more words to earn credits (3 words = 2 credits)', 'error')
+    showMessage('No delete credits available!', 'error')
   }
 }
 
@@ -190,12 +303,15 @@ const closeModal = () => {
 
 const deleteAllWords = async () => {
   showConfirmModal.value = false
+  saving.value = true
   
   const result = await bookStore.deleteAllWords()
+  
+  saving.value = false
+  
   if (result.success) {
     showMessage(`Successfully deleted all ${result.deletedCount} words!`, 'success')
     cancelDeleteMode()
-    // Refresh user stats
     await authStore.fetchUserStats()
   } else {
     showMessage(result.message, 'error')
@@ -208,105 +324,35 @@ const handleWordClick = async (event, word) => {
   event.preventDefault()
   event.stopPropagation()
   
-  // Allow admin to delete any word
   if (!isAdmin.value && word.author === authStore.currentUser?.id) {
     showMessage("You can't delete your own words!", 'error')
     return
   }
   
-  // Check credits for non-admin users
   if (!isAdmin.value && authStore.deleteCredits === 0) {
-    showMessage("You don't have any delete credits! Write more words to earn credits (3 words = 2 credits)", 'error')
+    showMessage("No delete credits available!", 'error')
     deleteMode.value = false
     return
   }
   
-  const confirmMessage = isAdmin.value 
-    ? `Delete "${word.text}"? (Admin: No credit cost)`
-    : `Delete "${word.text}"? This will cost 1 delete credit.`
-  
-  if (confirm(confirmMessage)) {
+  if (confirm(`Delete "${word.text}"?`)) {
+    saving.value = true
+    
     const result = await bookStore.deleteWord(word.position)
+    
+    saving.value = false
+    
     if (result.success) {
-      showMessage(`"${word.text}" deleted! ${isAdmin.value ? 'Admin: No credits used' : `${result.credits} credits remaining.`}`, 'success')
+      showMessage(`"${word.text}" deleted!`, 'success')
       if (!isAdmin.value) {
         await authStore.fetchUserStats()
         if (authStore.deleteCredits === 0) {
           deleteMode.value = false
-          showMessage('No delete credits left. Write more words to earn more credits!', 'info')
         }
       }
     } else {
       showMessage(result.message, 'error')
-      if (!isAdmin.value && result.message.includes('credits')) {
-        deleteMode.value = false
-      }
     }
-  }
-}
-
-const handleInput = (event) => {
-  const text = event.target.textContent
-  if (text.includes(' ') || text.includes('\n')) {
-    submitCurrentWord()
-  }
-}
-
-const handleKeydown = async (event) => {
-  if (event.key === ' ' || event.key === 'Enter') {
-    event.preventDefault()
-    await submitCurrentWord()
-    return
-  }
-  
-  if (event.key === 'Backspace' && inputSpanRef.value && inputSpanRef.value.textContent.length === 0) {
-    event.preventDefault()
-    showMessage('Use delete mode to remove words', 'error')
-    return
-  }
-}
-
-const submitCurrentWord = async () => {
-  if (!inputSpanRef.value) return
-  
-  const wordText = inputSpanRef.value.textContent.trim()
-  
-  if (wordText && wordText.length > 0) {
-    const result = await bookStore.addWord(wordText)
-    if (result.success) {
-      await authStore.fetchUserStats()
-      if (inputSpanRef.value) {
-        inputSpanRef.value.textContent = ''
-      }
-      showMessage(`Added: "${wordText}"`, 'success')
-    } else {
-      showMessage(result.message, 'error')
-    }
-  } else {
-    if (inputSpanRef.value) {
-      inputSpanRef.value.textContent = ''
-    }
-  }
-  
-  await nextTick()
-  if (inputSpanRef.value) {
-    inputSpanRef.value.focus()
-  }
-}
-
-const handleBlur = () => {
-  if (inputSpanRef.value && inputSpanRef.value.textContent.trim() === '') {
-    inputSpanRef.value.textContent = ''
-  }
-}
-
-const handlePaste = (event) => {
-  event.preventDefault()
-  const text = event.clipboardData.getData('text/plain')
-  const firstWord = text.trim().split(/\s+/)[0]
-  if (firstWord && inputSpanRef.value) {
-    inputSpanRef.value.textContent = firstWord
-    submitCurrentWord()
   }
 }
 
@@ -339,52 +385,34 @@ const logout = () => {
   router.push('/login')
 }
 
-// Socket.io event handlers
-socket.on('word-update', async (data) => {
+// Socket.io handlers
+socket.on('word-update', async () => {
   if (!isProcessingRemoteUpdate) {
     isProcessingRemoteUpdate = true
     await bookStore.fetchWords()
     isProcessingRemoteUpdate = false
-    
-    if (!deleteMode.value && data && data.userId !== authStore.currentUser?.id) {
-      showMessage(`${data.userName || 'Someone'} added a word`, 'info')
-    }
   }
 })
 
-socket.on('word-deleted', async (data) => {
+socket.on('word-deleted', async () => {
   if (!isProcessingRemoteUpdate) {
     isProcessingRemoteUpdate = true
     await bookStore.fetchWords()
     isProcessingRemoteUpdate = false
-    
-    if (data && data.userId !== authStore.currentUser?.id) {
-      showMessage(`${data.userName || 'Someone'} deleted a word`, 'info')
-    }
   }
 })
 
 onMounted(async () => {
   await bookStore.fetchWords()
   await authStore.fetchUserStats()
-  await nextTick()
-  
-  if (inputSpanRef.value) {
-    inputSpanRef.value.focus()
-  }
 })
 
 onUnmounted(() => {
   if (messageTimeout) clearTimeout(messageTimeout)
+  // Clean up socket listeners
+  socket.off('word-update')
+  socket.off('word-deleted')
 })
-
-watch(() => bookStore.words, () => {
-  nextTick(() => {
-    if (inputSpanRef.value && document.activeElement !== inputSpanRef.value) {
-      inputSpanRef.value.focus()
-    }
-  })
-}, { deep: true })
 </script>
 
 <style scoped>
@@ -728,5 +756,65 @@ watch(() => bookStore.words, () => {
   .word {
     font-size: 1rem;
   }
+}
+
+/* ... (keep all your existing styles) ... */
+
+/* Add these new styles */
+/* Keep all your existing styles, plus: */
+.insert-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 0.25rem;
+  cursor: pointer;
+  opacity: 0.4;
+  transition: all 0.2s;
+  font-size: 0.8rem;
+  padding: 0 0.25rem;
+  border-radius: 3px;
+  width: 20px;
+  height: 20px;
+}
+
+.insert-indicator:hover {
+  opacity: 1;
+  background: #4299e1;
+  color: white;
+  transform: scale(1.1);
+}
+
+.insert-beginning, .insert-end {
+  width: auto;
+  font-size: 0.7rem;
+  padding: 0.125rem 0.25rem;
+}
+
+.insert-between {
+  font-size: 0.7rem;
+}
+
+.word {
+  display: inline-block;
+  margin: 0;
+  padding: 0.125rem 0.25rem;
+  border-radius: 3px;
+  transition: all 0.2s;
+  cursor: text;
+  white-space: pre;
+}
+
+.word.own-word {
+  background: #ebf8ff;
+}
+
+.word.deletable {
+  cursor: pointer;
+  background: #fed7d7;
+}
+
+.word.deletable:hover {
+  background: #fc8181;
+  transform: scale(1.02);
 }
 </style>

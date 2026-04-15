@@ -30,15 +30,26 @@ export const useBookStore = defineStore('book', {
       }
     },
     
-    async addWord(wordText) {
-      try {
-        const response = await axios.post('/api/book/words', { text: wordText })
-        this.words.push(response.data)
-        return { success: true }
-      } catch (error) {
-        return { success: false, message: error.response?.data?.message || 'Failed to add word' }
-      }
-    },
+// stores/book.js
+// stores/book.js
+
+async addWord(wordText, insertAtPosition = null) {
+  try {
+    const payload = { text: wordText };
+    if (insertAtPosition !== null && insertAtPosition !== undefined) {
+      payload.insertAtPosition = insertAtPosition;
+    }
+    
+    const response = await axios.post('/api/book/words', payload);
+    
+    // Refetch all words to get updated positions
+    await this.fetchWords();
+    
+    return { success: true, word: response.data };
+  } catch (error) {
+    return { success: false, message: error.response?.data?.message || 'Failed to add word' };
+  }
+},
     
     async deleteWord(position) {
       try {
