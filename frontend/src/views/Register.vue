@@ -1,6 +1,9 @@
 <template>
   <div class="auth-container">
     <div class="auth-card">
+      <!-- Reusable back button component -->
+      <BackToHome />
+
       <h2>Register for Collaborative Book</h2>
       <form @submit.prevent="handleRegister">
         <div class="form-group">
@@ -31,6 +34,7 @@
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
+import BackToHome from '../components/BackToHome.vue' // Adjust path as needed
 
 const router = useRouter()
 const authStore = useAuthStore()

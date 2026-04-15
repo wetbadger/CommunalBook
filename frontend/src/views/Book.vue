@@ -391,7 +391,7 @@ const hideTooltip = (event) => {
 
 const logout = () => {
   authStore.logout()
-  router.push('/login')
+  router.push('/')
 }
 
 // Socket.io handlers

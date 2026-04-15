@@ -1,6 +1,9 @@
 <template>
   <div class="auth-container">
     <div class="auth-card">
+      <!-- Reusable back button component -->
+      <BackToHome />
+      
       <h2>Login to Collaborative Book</h2>
       <form @submit.prevent="handleLogin">
         <div class="form-group">
@@ -31,6 +34,7 @@
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
+import BackToHome from '../components/BackToHome.vue' // Adjust path as needed
 
 const router = useRouter()
 const authStore = useAuthStore()
@@ -68,6 +72,7 @@ const handleLogin = async () => {
   box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
   width: 100%;
   max-width: 400px;
+  position: relative;
 }
 
 .auth-card h2 {
@@ -86,6 +91,12 @@ input {
   border: 1px solid #ddd;
   border-radius: 5px;
   font-size: 1rem;
+  transition: border-color 0.3s ease;
+}
+
+input:focus {
+  outline: none;
+  border-color: #667eea;
 }
 
 button {
@@ -97,6 +108,7 @@ button {
   border-radius: 5px;
   font-size: 1rem;
   cursor: pointer;
+  transition: background 0.3s ease;
 }
 
 button:hover:not(:disabled) {
@@ -122,5 +134,22 @@ p {
 a {
   color: #667eea;
   text-decoration: none;
+  transition: color 0.3s ease;
+}
+
+a:hover {
+  color: #5a67d8;
+}
+
+@media (max-width: 480px) {
+  .auth-card {
+    margin: 1rem;
+    padding: 1.5rem;
+  }
+  
+  .auth-card h2 {
+    font-size: 1.5rem;
+    margin-bottom: 1.5rem;
+  }
 }
 </style>
