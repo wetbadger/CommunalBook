@@ -1,3 +1,5 @@
+<!-- frontend/src/views/Book.vue - Complete version with no loading spinner -->
+
 <template>
   <div class="book-container" :class="{ 'deleting-active': deletionLock || bookStore.isDeleting }">
     <header class="header">
@@ -62,8 +64,9 @@
       </div>
 
       <div class="document">
+        <!-- Initial loading only - never shows again -->
         <div 
-          v-if="bookStore.loading" 
+          v-if="bookStore.loading && bookStore.needsInitialLoad" 
           class="loading"
         >
           Loading document...
@@ -75,7 +78,7 @@
           ref="editorRef"
         >
           <div class="words-wrapper">
-            <!-- Insert at beginning indicator - only show when not in insert mode -->
+            <!-- Insert at beginning indicator -->
             <span 
               v-if="!deleteMode && activeInsertMode !== 'before' && !insertingAtBeginning" 
               class="insert-indicator insert-beginning"
@@ -116,7 +119,11 @@
                   'own-word': word.author === authStore.currentUser?.id,
                   'high-cost': deleteMode && word.deletionCost && word.deletionCost >= 100,
                   'medium-cost': deleteMode && word.deletionCost && word.deletionCost >= 10 && word.deletionCost < 100,
-                  'deleting': pendingDeletion === word._id
+                  'deleting': pendingDeletion === word._id || word._deleting,
+                  'optimistic': word._optimistic,
+                  'just-added': word._justAdded,
+                  'remote-added': word._remote,
+                  'optimistic-like': word._optimisticLike
                 }"
                 @click="handleWordClick($event, word)"
                 @mouseenter="showTooltip($event, word)"
@@ -126,6 +133,9 @@
                 <span class="like-button" @click.stop="toggleLike(word)">
                   {{ word.userLiked ? '❤️' : '🤍' }}
                 </span>
+                <span v-if="word.likes > 0" class="like-count">
+                  {{ word.likes }}
+                </span>
                 <span v-if="deleteMode && word.deletionCost && !isAdmin && word.author !== authStore.currentUser?.id" 
                       class="delete-cost"
                       :class="{
@@ -134,9 +144,11 @@
                       }">
                   {{ word.deletionCost }}
                 </span>
+                <span v-if="word._optimistic" class="status-badge">⏳</span>
+                <span v-if="word._remote" class="status-badge remote">✨</span>
               </span>
               
-              <!-- Insert after this word indicator - only show when not in insert mode for this position -->
+              <!-- Insert after this word indicator -->
               <span 
                 v-if="!deleteMode && !(activeInsertRefWord?._id === word._id)" 
                 class="insert-indicator insert-between"
@@ -184,7 +196,7 @@
       </div>
     </div>
 
-    <!-- Rest of your modals and messages... -->
+    <!-- Modals -->
     <div v-if="showConfirmModal" class="modal-overlay" @click.self="closeModal">
       <div class="modal-content">
         <h3>⚠️ Delete All Words</h3>
@@ -215,14 +227,13 @@ import { useBookStore } from '../stores/book'
 import { io } from 'socket.io-client'
 import WordInput from '../components/WordInput.vue'
 
-const socket = io('http://localhost:3000')
 const router = useRouter()
 const authStore = useAuthStore()
 const bookStore = useBookStore()
 
 const deleteMode = ref(false)
 const activeInsertMode = ref(null) // 'before', 'after', or null
-const activeInsertRefWord = ref(null) // The word to insert before/after (null means beginning or end)
+const activeInsertRefWord = ref(null)
 const message = ref('')
 const messageType = ref('info')
 const showConfirmModal = ref(false)
@@ -234,7 +245,7 @@ const isAddingWord = ref(false)
 const isLikingWord = ref(false)
 const insertingAtBeginning = ref(false)
 let messageTimeout = null
-let isProcessingRemoteUpdate = false
+let socket = null
 
 const isAdmin = computed(() => authStore.currentUser?.username === 'admin')
 
@@ -264,7 +275,6 @@ const activateInsertBefore = (word) => {
     return
   }
   
-  // Only allow insert at beginning
   if (word) {
     showMessage('Insert before mode only works at the beginning. Use insert after for other positions.', 'warning')
     return
@@ -276,7 +286,6 @@ const activateInsertBefore = (word) => {
     activeInsertMode.value = 'before'
     showMessage(`Insert mode active at beginning (before "${firstWord.text}")`, 'info')
   } else {
-    // Book is empty, just use after mode
     activeInsertMode.value = 'after'
     activeInsertRefWord.value = null
     showMessage('Book is empty, will add first word', 'info')
@@ -289,9 +298,6 @@ const cancelInsertMode = () => {
   showMessage('Insert mode cancelled', 'info')
 }
 
-// Store the word we're inserting after/before
-const lastInsertedAfterWord = ref(null)
-
 const handleWordSubmit = async ({ text }) => {
   if (isAddingWord.value || bookStore.isAdding) {
     showMessage('Please wait, already adding a word...', 'warning')
@@ -301,7 +307,6 @@ const handleWordSubmit = async ({ text }) => {
   isAddingWord.value = true
   saving.value = true
   
-  // Store current insert position before clearing
   const insertBeforeThis = activeInsertRefWord.value
   const currentMode = activeInsertMode.value
   
@@ -321,20 +326,16 @@ const handleWordSubmit = async ({ text }) => {
     await authStore.fetchUserStats()
     await nextTick()
     
-    // For both modes, automatically switch to after mode for continuous typing
+    // Auto-continue typing after successful add
     if (currentMode === 'after') {
-      // After mode: activate insert after the newly added word
       if (insertBeforeThis) {
-        // Find where we added the word (after the reference word)
         const refIndex = bookStore.words.findIndex(w => w._id === insertBeforeThis._id)
         if (refIndex !== -1 && refIndex + 1 < bookStore.words.length) {
-          // Activate after the word we just added
           activateInsertAfter(bookStore.words[refIndex + 1])
           showMessage(`Added "${text}"! Keep typing...`, 'success')
           return
         }
       } else if (insertBeforeThis === null) {
-        // Added at the end, activate after the last word (which is the newly added word)
         const lastWord = bookStore.words[bookStore.words.length - 1]
         if (lastWord) {
           activateInsertAfter(lastWord)
@@ -343,8 +344,6 @@ const handleWordSubmit = async ({ text }) => {
         }
       }
     } else if (currentMode === 'before') {
-      // Before mode (only at beginning): after adding, switch to after mode
-      // Activate insert after the newly added word (which is now at position 0)
       const firstWord = bookStore.words[0]
       if (firstWord) {
         activateInsertAfter(firstWord)
@@ -353,12 +352,26 @@ const handleWordSubmit = async ({ text }) => {
       }
     }
     
-    // If we couldn't auto-reactivate, just cancel mode
     cancelInsertMode()
     showMessage(`Added "${text}"!`, 'success')
   } else {
     showMessage(result.message, 'error')
     cancelInsertMode()
+  }
+}
+
+const enableDeleteMode = () => {
+  if (deletionLock.value || bookStore.isDeleting) {
+    showMessage('Please wait for current operation to complete', 'warning')
+    return
+  }
+  
+  if (isAdmin.value || authStore.deleteCredits > 0) {
+    deleteMode.value = true
+    updateDeletionCosts()
+    showMessage('Delete mode activated! Click on any word (not yours) to delete it', 'info')
+  } else {
+    showMessage('No delete credits available!', 'error')
   }
 }
 
@@ -371,32 +384,17 @@ const cancelDeleteMode = () => {
   showMessage('Delete mode deactivated', 'info')
 }
 
-const confirmDeleteAllWords = () => {
-  if (bookStore.wordCount === 0) {
-    showMessage('No words to delete', 'error')
-    return
-  }
-  showConfirmModal.value = true
-}
-
-const closeModal = () => {
-  showConfirmModal.value = false
-}
-
-const deleteAllWords = async () => {
-  showConfirmModal.value = false
-  saving.value = true
-  
-  const result = await bookStore.deleteAllWords()
-  
-  saving.value = false
-  
-  if (result.success) {
-    showMessage(`Successfully deleted all ${result.deletedCount} words!`, 'success')
-    cancelDeleteMode()
-    await authStore.fetchUserStats()
-  } else {
-    showMessage(result.message, 'error')
+const updateDeletionCosts = async () => {
+  if (deleteMode.value && !isAdmin.value) {
+    for (const word of bookStore.words) {
+      if (word.author !== authStore.currentUser?.id && !word._optimistic) {
+        const costInfo = await bookStore.getDeletionCost(word._id)
+        word.deletionCost = costInfo.cost
+        word.deviations = costInfo.deviations
+      } else {
+        word.deletionCost = 0
+      }
+    }
   }
 }
 
@@ -464,7 +462,6 @@ const handleWordClick = async (event, word) => {
       } else {
         if (result.alreadyDeleted) {
           showMessage('This word has already been deleted', 'warning')
-          await bookStore.fetchWords()
         } else {
           showMessage(result.message, 'error')
         }
@@ -477,79 +474,6 @@ const handleWordClick = async (event, word) => {
       pendingDeletion.value = null
       saving.value = false
     }
-  }
-}
-
-const updateDeletionCosts = async () => {
-  if (deleteMode.value && !isAdmin.value) {
-    for (const word of bookStore.words) {
-      if (word.author !== authStore.currentUser?.id) {
-        const costInfo = await bookStore.getDeletionCost(word._id)
-        word.deletionCost = costInfo.cost
-        word.deviations = costInfo.deviations
-      } else {
-        word.deletionCost = 0
-      }
-    }
-  }
-}
-
-const showTooltip = async (event, word) => {
-  let tooltipContent = `
-    ✍️ Written by: ${word.authorName}<br>
-    ❤️ Likes: ${word.likes || 0}
-  `
-  
-  if (deleteMode.value && !isAdmin.value && word.author !== authStore.currentUser?.id) {
-    let costInfo = word.deletionCost
-    if (!costInfo) {
-      costInfo = await bookStore.getDeletionCost(word._id)
-      word.deletionCost = costInfo.cost
-      word.deviations = costInfo.deviations
-    }
-
-    tooltipContent += `<br>💸 Deletion cost: ${costInfo} credit(s)`
-    if (costInfo.deviations >= 1) {
-      tooltipContent += `<br>📊 ${costInfo.deviations.toFixed(1)} std dev above average`
-    }
-  }
-  
-  const tooltip = document.createElement('div')
-  tooltip.className = 'word-tooltip'
-  tooltip.innerHTML = tooltipContent
-  tooltip.style.position = 'absolute'
-  tooltip.style.left = `${event.clientX + 10}px`
-  tooltip.style.top = `${event.clientY - 30}px`
-  tooltip.style.backgroundColor = '#2d3748'
-  tooltip.style.color = 'white'
-  tooltip.style.padding = '8px 12px'
-  tooltip.style.borderRadius = '4px'
-  tooltip.style.fontSize = '12px'
-  tooltip.style.pointerEvents = 'none'
-  tooltip.style.zIndex = '1000'
-  tooltip.style.whiteSpace = 'nowrap'
-  document.body.appendChild(tooltip)
-  event.target._tooltip = tooltip
-}
-
-const enableDeleteMode = () => {
-  if (deletionLock.value || bookStore.isDeleting) {
-    showMessage('Please wait for current operation to complete', 'warning')
-    return
-  }
-  
-  if (isAdmin.value || authStore.deleteCredits > 0) {
-    deleteMode.value = true
-    updateDeletionCosts()
-    showMessage('Delete mode activated! Click on any word (not yours) to delete it', 'info')
-  } else {
-    showMessage('No delete credits available!', 'error')
-  }
-}
-
-const hideTooltip = (event) => {
-  if (event.target._tooltip) {
-    event.target._tooltip.remove()
   }
 }
 
@@ -588,6 +512,79 @@ const toggleLike = async (word) => {
   }
 }
 
+const confirmDeleteAllWords = () => {
+  if (bookStore.wordCount === 0) {
+    showMessage('No words to delete', 'error')
+    return
+  }
+  showConfirmModal.value = true
+}
+
+const closeModal = () => {
+  showConfirmModal.value = false
+}
+
+const deleteAllWords = async () => {
+  showConfirmModal.value = false
+  saving.value = true
+  
+  const result = await bookStore.deleteAllWords()
+  
+  saving.value = false
+  
+  if (result.success) {
+    showMessage(`Successfully deleted all ${result.deletedCount} words!`, 'success')
+    cancelDeleteMode()
+    await authStore.fetchUserStats()
+  } else {
+    showMessage(result.message, 'error')
+  }
+}
+
+const showTooltip = async (event, word) => {
+  let tooltipContent = `
+    ✍️ Written by: ${word.authorName}<br>
+    ❤️ Likes: ${word.likes || 0}
+  `
+  
+  if (deleteMode.value && !isAdmin.value && word.author !== authStore.currentUser?.id) {
+    let costInfo = word.deletionCost
+    if (!costInfo && !word._optimistic) {
+      costInfo = await bookStore.getDeletionCost(word._id)
+      word.deletionCost = costInfo.cost
+      word.deviations = costInfo.deviations
+    }
+
+    tooltipContent += `<br>💸 Deletion cost: ${costInfo} credit(s)`
+    if (word.deviations >= 1) {
+      tooltipContent += `<br>📊 ${word.deviations.toFixed(1)} std dev above average`
+    }
+  }
+  
+  const tooltip = document.createElement('div')
+  tooltip.className = 'word-tooltip'
+  tooltip.innerHTML = tooltipContent
+  tooltip.style.position = 'absolute'
+  tooltip.style.left = `${event.clientX + 10}px`
+  tooltip.style.top = `${event.clientY - 30}px`
+  tooltip.style.backgroundColor = '#2d3748'
+  tooltip.style.color = 'white'
+  tooltip.style.padding = '8px 12px'
+  tooltip.style.borderRadius = '4px'
+  tooltip.style.fontSize = '12px'
+  tooltip.style.pointerEvents = 'none'
+  tooltip.style.zIndex = '1000'
+  tooltip.style.whiteSpace = 'nowrap'
+  document.body.appendChild(tooltip)
+  event.target._tooltip = tooltip
+}
+
+const hideTooltip = (event) => {
+  if (event.target._tooltip) {
+    event.target._tooltip.remove()
+  }
+}
+
 const logout = () => {
   authStore.logout()
   router.push('/')
@@ -599,36 +596,7 @@ const handleKeydown = (event) => {
   }
 }
 
-// Socket.io handlers
-socket.on('word-update', async () => {
-  if (!isProcessingRemoteUpdate) {
-    isProcessingRemoteUpdate = true
-    await bookStore.fetchWords()
-    isProcessingRemoteUpdate = false
-  }
-})
-
-socket.on('word-deleted', async () => {
-  if (!isProcessingRemoteUpdate) {
-    isProcessingRemoteUpdate = true
-    await bookStore.fetchWords()
-    isProcessingRemoteUpdate = false
-  }
-})
-
-onMounted(async () => {
-  await bookStore.fetchWords()
-  await authStore.fetchUserStats()
-  document.addEventListener('keydown', handleKeydown)
-})
-
-onUnmounted(() => {
-  if (messageTimeout) clearTimeout(messageTimeout)
-  document.removeEventListener('keydown', handleKeydown)
-  socket.off('word-update')
-  socket.off('word-deleted')
-})
-
+// Watch for delete mode changes
 watch(deleteMode, (newVal) => {
   if (newVal && !isAdmin.value && !deletionLock.value) {
     updateDeletionCosts()
@@ -640,7 +608,30 @@ watch(() => bookStore.words, () => {
     updateDeletionCosts()
   }
 }, { deep: true })
+
+onMounted(async () => {
+  // Initialize WebSocket for real-time updates
+  socket = io('http://localhost:3000')
+  bookStore.initWebSocket?.()
+  
+  // Initial load (only happens once)
+  await bookStore.loadInitialBook()
+  await authStore.fetchUserStats()
+  
+  // Start background sync
+  bookStore.startBackgroundSync?.()
+  
+  document.addEventListener('keydown', handleKeydown)
+})
+
+onUnmounted(() => {
+  if (messageTimeout) clearTimeout(messageTimeout)
+  document.removeEventListener('keydown', handleKeydown)
+  if (socket) socket.disconnect()
+  bookStore.stopBackgroundSync?.()
+})
 </script>
+
 
 <style scoped>
 .book-container {
@@ -1162,5 +1153,64 @@ watch(() => bookStore.words, () => {
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }
+}
+
+/* Add these additional styles for status badges */
+.word.optimistic {
+  opacity: 0.85;
+  animation: pulse 0.5s ease-in-out;
+}
+
+.word.just-added {
+  animation: highlightWord 0.5s ease-out;
+}
+
+.word.remote-added {
+  animation: fadeInWord 0.3s ease-out;
+}
+
+.word.optimistic-like .like-button {
+  animation: likePulse 0.3s ease-in-out;
+}
+
+.status-badge {
+  font-size: 10px;
+  margin-left: 4px;
+  opacity: 0.7;
+}
+
+.status-badge.remote {
+  color: #4299e1;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.85; }
+  50% { opacity: 1; }
+}
+
+@keyframes likePulse {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.2); }
+  100% { transform: scale(1); }
+}
+
+@keyframes fadeInWord {
+  from {
+    opacity: 0;
+    transform: translateY(-5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes highlightWord {
+  0% {
+    background-color: rgba(66, 153, 225, 0.3);
+  }
+  100% {
+    background-color: transparent;
+  }
 }
 </style>
