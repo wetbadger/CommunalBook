@@ -114,6 +114,8 @@ router.post('/words',
       let newWord;
       
       // Determine insertion method
+      console.log(insertAfterWordId);
+      console.log(insertBeforeWordId);
       if (insertAfterWordId !== undefined && insertAfterWordId !== null) {
         // Insert after specific word
         newWord = await linkedListService.insertWordAfter({
@@ -121,7 +123,7 @@ router.post('/words',
           author: req.user.userId,
           authorName: req.user.username
         }, insertAfterWordId);
-      } else if (insertBeforeWordId !== undefined && insertBeforeWordId !== null) {
+      } else if (insertBeforeWordId !== undefined) {
         // Insert before specific word
         newWord = await linkedListService.insertWordBefore({
           text: text.trim(),

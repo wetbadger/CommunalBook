@@ -49,12 +49,12 @@ export const calculateLikeStats = async () => {
 };
 
 export const getDeletionCost = (likes, average, stdDev) => {
-  if (stdDev === 0) return 1; // No variation, base cost
+  if (stdDev === 0) return 1;
   
   const deviations = (likes - average) / stdDev;
+  if (deviations <= 0) return 1;
   
-  if (deviations >= 3) return 1000;
-  if (deviations >= 2) return 100;
-  if (deviations >= 1) return 10;
-  return 1;
+  // Smooth exponential growth: cost = e^(deviations * k)
+  const k = Math.log(10); // Adjusts growth rate
+  return Math.floor(Math.exp(deviations * k));
 };

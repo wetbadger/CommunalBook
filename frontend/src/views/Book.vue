@@ -77,14 +77,14 @@
           <div class="words-wrapper">
             <!-- Insert at beginning indicator - only show when not in insert mode -->
             <span 
-              v-if="!deleteMode && !(activeInsertMode === 'before' && activeInsertRefWord === null)" 
+              v-if="!deleteMode && activeInsertMode !== 'before' && !insertingAtBeginning" 
               class="insert-indicator insert-beginning"
               @click.stop="activateInsertBefore(null)"
               title="Insert at beginning"
             >
-              ⬅️ Insert here
+              ➕
             </span>
-            
+                        
             <!-- Insert before input (at beginning) -->
             <WordInput
               v-if="activeInsertMode === 'before' && activeInsertRefWord === null"
@@ -138,7 +138,7 @@
               
               <!-- Insert after this word indicator - only show when not in insert mode for this position -->
               <span 
-                v-if="!deleteMode && !(activeInsertMode === 'after' && activeInsertRefWord?._id === word._id)" 
+                v-if="!deleteMode && !(activeInsertRefWord?._id === word._id)" 
                 class="insert-indicator insert-between"
                 @click.stop="activateInsertAfter(word)"
                 :title="`Insert after '${word.text}'`"
@@ -232,6 +232,7 @@ const pendingDeletion = ref(null)
 const deletionLock = ref(false)
 const isAddingWord = ref(false)
 const isLikingWord = ref(false)
+const insertingAtBeginning = ref(false)
 let messageTimeout = null
 let isProcessingRemoteUpdate = false
 
@@ -263,9 +264,23 @@ const activateInsertBefore = (word) => {
     return
   }
   
-  activeInsertMode.value = 'before'
-  activeInsertRefWord.value = word
-  showMessage(word ? `Insert mode active before "${word.text}"` : 'Insert mode active at beginning', 'info')
+  // Only allow insert at beginning
+  if (word) {
+    showMessage('Insert before mode only works at the beginning. Use insert after for other positions.', 'warning')
+    return
+  }
+  
+  const firstWord = bookStore.words[0]
+  if (firstWord) {
+    activeInsertRefWord.value = firstWord
+    activeInsertMode.value = 'before'
+    showMessage(`Insert mode active at beginning (before "${firstWord.text}")`, 'info')
+  } else {
+    // Book is empty, just use after mode
+    activeInsertMode.value = 'after'
+    activeInsertRefWord.value = null
+    showMessage('Book is empty, will add first word', 'info')
+  }
 }
 
 const cancelInsertMode = () => {
@@ -287,14 +302,14 @@ const handleWordSubmit = async ({ text }) => {
   saving.value = true
   
   // Store current insert position before clearing
-  const insertAfterThis = activeInsertRefWord.value
+  const insertBeforeThis = activeInsertRefWord.value
   const currentMode = activeInsertMode.value
   
   const options = {}
   if (currentMode === 'after') {
-    options.insertAfterWordId = insertAfterThis?._id || null
+    options.insertAfterWordId = insertBeforeThis?._id || null
   } else if (currentMode === 'before') {
-    options.insertBeforeWordId = insertAfterThis?._id || null
+    options.insertBeforeWordId = insertBeforeThis?._id || null
   }
   
   const result = await bookStore.addWord(text, options)
@@ -304,32 +319,37 @@ const handleWordSubmit = async ({ text }) => {
   
   if (result.success) {
     await authStore.fetchUserStats()
+    await nextTick()
     
-    // Instead of canceling, automatically set up the next insert position
+    // For both modes, automatically switch to after mode for continuous typing
     if (currentMode === 'after') {
-      // For after mode, we want to insert after the word we just added
-      // Wait a moment for the words array to update
-      await nextTick()
-      
-      // Find the word we just added (it should be the one with matching text and recent timestamp)
-      // Or more simply, if we were inserting after a specific word, the new word is after that
-      if (insertAfterThis) {
-        // Find the index of the reference word
-        const refIndex = bookStore.words.findIndex(w => w._id === insertAfterThis._id)
+      // After mode: activate insert after the newly added word
+      if (insertBeforeThis) {
+        // Find where we added the word (after the reference word)
+        const refIndex = bookStore.words.findIndex(w => w._id === insertBeforeThis._id)
         if (refIndex !== -1 && refIndex + 1 < bookStore.words.length) {
-          // Activate insert after the newly added word
+          // Activate after the word we just added
           activateInsertAfter(bookStore.words[refIndex + 1])
           showMessage(`Added "${text}"! Keep typing...`, 'success')
           return
         }
-      } else if (insertAfterThis === null) {
-        // We were inserting at the end, so the new word is at the end
+      } else if (insertBeforeThis === null) {
+        // Added at the end, activate after the last word (which is the newly added word)
         const lastWord = bookStore.words[bookStore.words.length - 1]
         if (lastWord) {
           activateInsertAfter(lastWord)
           showMessage(`Added "${text}"! Keep typing...`, 'success')
           return
         }
+      }
+    } else if (currentMode === 'before') {
+      // Before mode (only at beginning): after adding, switch to after mode
+      // Activate insert after the newly added word (which is now at position 0)
+      const firstWord = bookStore.words[0]
+      if (firstWord) {
+        activateInsertAfter(firstWord)
+        showMessage(`Added "${text}" at beginning! Now adding after it...`, 'success')
+        return
       }
     }
     
