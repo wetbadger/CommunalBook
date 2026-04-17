@@ -39,11 +39,15 @@ export const idempotencyMiddleware = (req, res, next) => {
   // Check if this request has been processed before
   const existingResponse = idempotencyStore.get(idempotencyKey);
   
-  if (existingResponse) {
-    console.log(`🔄 Idempotent request detected: ${idempotencyKey}`);
-    // Return the cached response
-    return res.status(existingResponse.status).json(existingResponse.data);
+if (existingResponse) {
+  // If still processing, don't return cached response
+  if (existingResponse.status === 'processing') {
+    console.log(`⏳ Request still processing: ${idempotencyKey}`);
+    return next(); // Let it process normally
   }
+  console.log(`🔄 Idempotent request detected: ${idempotencyKey}`);
+  return res.status(existingResponse.status).json(existingResponse.data);
+}
   
   // Store that this request is being processed
   idempotencyStore.set(idempotencyKey, {
