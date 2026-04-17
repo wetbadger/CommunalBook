@@ -1,9 +1,9 @@
 ================================================================================
 VibeCoding Context Export
 ================================================================================
-Root directory: /workspaces/CommunalBook
+Root directory: /home/worryword/Development/collaborative-book
 Style tag stripping: ON
-Total files: 23
+Total files: 26
 ================================================================================
 
 
@@ -18,7 +18,24 @@ scripts/vibecode_context.txt
 FILE: backend/middleware/auth.js
 ================================================================================
 
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+// Load .env if not already loaded
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.join(__dirname, '../.env') });
+
 import jwt from 'jsonwebtoken';
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('❌ JWT_SECRET is not defined in environment variables');
+  console.error('Current NODE_ENV:', process.env.NODE_ENV);
+  console.error('__dirname:', __dirname);
+  process.exit(1);
+}
 
 export const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
@@ -28,13 +45,108 @@ export const authenticateToken = (req, res, next) => {
     return res.status(401).json({ message: 'Access token required' });
   }
 
-  jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key', (err, user) => {
+  jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) {
       return res.status(403).json({ message: 'Invalid or expired token' });
     }
     req.user = user;
     next();
   });
+};
+
+
+================================================================================
+FILE: backend/middleware/idempotency.js
+================================================================================
+
+// backend/middleware/idempotency.js
+import crypto from 'crypto';
+
+// Store for idempotency keys (use Redis in production)
+const idempotencyStore = new Map();
+
+// Clean up old entries every hour
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of idempotencyStore.entries()) {
+    if (now - entry.timestamp > 300000) { // 5 minutes
+      idempotencyStore.delete(key);
+    }
+  }
+}, 3600000); // Run every hour
+
+export const idempotencyMiddleware = (req, res, next) => {
+  // Only apply to state-changing methods
+  const stateChangingMethods = ['POST', 'PUT', 'PATCH', 'DELETE'];
+  if (!stateChangingMethods.includes(req.method)) {
+    return next();
+  }
+  
+  // Get idempotency key from header
+  let idempotencyKey = req.headers['idempotency-key'];
+  
+  // Auto-generate key for DELETE requests if not provided (optional)
+  if (!idempotencyKey && req.method === 'DELETE') {
+    // Create a key based on user + path + body
+    const hashInput = `${req.user?.userId || 'anonymous'}:${req.path}:${JSON.stringify(req.body)}:${req.params.position}`;
+    idempotencyKey = crypto.createHash('sha256').update(hashInput).digest('hex');
+    req.headers['idempotency-key'] = idempotencyKey;
+  }
+  
+  if (!idempotencyKey) {
+    return next();
+  }
+  
+  // Check if this request has been processed before
+  const existingResponse = idempotencyStore.get(idempotencyKey);
+  
+  if (existingResponse) {
+    console.log(`🔄 Idempotent request detected: ${idempotencyKey}`);
+    // Return the cached response
+    return res.status(existingResponse.status).json(existingResponse.data);
+  }
+  
+  // Store that this request is being processed
+  idempotencyStore.set(idempotencyKey, {
+    status: 'processing',
+    timestamp: Date.now()
+  });
+  
+  // Capture the original send/json methods
+  const originalJson = res.json.bind(res);
+  const originalSend = res.send.bind(res);
+  
+  // Override json method
+  res.json = function(data) {
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      // Store successful response
+      idempotencyStore.set(idempotencyKey, {
+        status: res.statusCode,
+        data: data,
+        timestamp: Date.now()
+      });
+    } else if (res.statusCode >= 400) {
+      // Remove processing marker for errors so client can retry
+      idempotencyStore.delete(idempotencyKey);
+    }
+    originalJson(data);
+  };
+  
+  // Override send method (for non-JSON responses)
+  res.send = function(data) {
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      idempotencyStore.set(idempotencyKey, {
+        status: res.statusCode,
+        data: data,
+        timestamp: Date.now()
+      });
+    } else if (res.statusCode >= 400) {
+      idempotencyStore.delete(idempotencyKey);
+    }
+    originalSend(data);
+  };
+  
+  next();
 };
 
 
@@ -152,11 +264,7 @@ const wordSchema = new mongoose.Schema({
     ref: 'Word',
     default: null
   },
-  // For quick ordering without traversing entire list
-  order: {
-    type: Number,
-    index: true  // For sorting when needed
-  },
+  // REMOVED: order field - no longer needed
   author: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
@@ -180,9 +288,6 @@ const wordSchema = new mongoose.Schema({
   }
 });
 
-// Add index for faster queries
-wordSchema.index({ order: 1 });
-
 export default mongoose.model('Word', wordSchema);
 
 
@@ -193,10 +298,25 @@ FILE: backend/routes/auth.js
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import User from '../models/User.js';
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+// Load .env if not already loaded
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.join(__dirname, '../.env') });
 
 const router = express.Router();
 
-// Fix: Add 'next' as a parameter for proper error handling
+// Check if JWT_SECRET is set
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+  console.error('❌ JWT_SECRET is not defined in environment variables');
+  process.exit(1);
+}
+
 router.post('/register', async (req, res, next) => {
   try {
     const { username, password } = req.body;
@@ -211,7 +331,7 @@ router.post('/register', async (req, res, next) => {
     
     const token = jwt.sign(
       { userId: user._id, username: user.username },
-      process.env.JWT_SECRET || 'your-secret-key',
+      JWT_SECRET,  // Use the validated secret
       { expiresIn: '7d' }
     );
     
@@ -225,7 +345,6 @@ router.post('/register', async (req, res, next) => {
       } 
     });
   } catch (error) {
-    // Pass error to Express error handler
     next(error);
   }
 });
@@ -246,7 +365,7 @@ router.post('/login', async (req, res, next) => {
     
     const token = jwt.sign(
       { userId: user._id, username: user.username },
-      process.env.JWT_SECRET || 'your-secret-key',
+      JWT_SECRET,  // Use the validated secret
       { expiresIn: '7d' }
     );
     
@@ -271,99 +390,27 @@ export default router;
 FILE: backend/routes/book.js
 ================================================================================
 
-// routes/book.js
-// routes/book.js
+// backend/routes/book.js
 import express from 'express';
 import Word from '../models/Word.js';
 import User from '../models/User.js';
 import { authenticateToken } from '../middleware/auth.js';
+import { idempotencyMiddleware } from '../middleware/idempotency.js';
 import Stats from '../models/Stats.js';
 import { getDeletionCost } from '../utils/statsCalculator.js';
 import linkedListService from '../services/linkedListService.js';
 
 const router = express.Router();
 
-// Get all words (now using linked list)
+// ==================== GET ROUTES ====================
+
+// Get all words
 router.get('/words', async (req, res) => {
   try {
     const words = await linkedListService.getBookInOrder();
     res.json(words);
   } catch (error) {
     res.status(500).json({ message: 'Error fetching words', error: error.message });
-  }
-});
-
-// Add a word (requires auth)
-// routes/book.js - Complete updated POST endpoint
-// Add a word using linked list
-router.post('/words', authenticateToken, async (req, res) => {
-  try {
-    const { text, insertAtPosition } = req.body;
-    
-    if (!text || text.trim().split(/\s+/).length !== 1) {
-      return res.status(400).json({ message: 'Only single words allowed' });
-    }
-    
-    let position;
-    const wordCount = await linkedListService.getWordCount();
-    
-    // Determine insertion position
-    if (insertAtPosition !== undefined && insertAtPosition !== null && insertAtPosition <= wordCount) {
-      position = insertAtPosition;
-    } else {
-      position = wordCount; // Append to end
-    }
-    
-    const newWord = await linkedListService.insertWordAtPosition({
-      text: text.trim(),
-      author: req.user.userId,
-      authorName: req.user.username
-    }, position);
-    
-    // Update user's word count
-    const user = await User.findById(req.user.userId);
-    user.wordsWritten += 1;
-    
-    if (user.username !== 'admin') {
-      if (user.wordsWritten % 3 === 0) {
-        user.deleteCredits += 2;
-      }
-    } else {
-      user.deleteCredits = 999999;
-    }
-    
-    await user.save();
-    
-    res.status(201).json(newWord);
-  } catch (error) {
-    console.error('Add word error:', error);
-    res.status(500).json({ message: 'Error adding word', error: error.message });
-  }
-});
-
-// Delete all words (admin only)
-router.delete('/words', authenticateToken, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.userId);
-    
-    // Check if user is admin
-    if (user.username !== 'admin') {
-      return res.status(403).json({ message: 'Admin access required' });
-    }
-    
-    const deletedCount = await Word.countDocuments();
-    await Word.deleteMany({});
-    
-    // Reset positions for any future words
-    // No need to reorder since all words are deleted
-    
-    res.json({ 
-      message: 'All words deleted successfully', 
-      deletedCount: deletedCount 
-    });
-  } catch (error) {
-    console.error('Delete all words error:', error);
-    res.status(500).json({ message: 'Error deleting all words', error: error.message });
   }
 });
 
@@ -378,67 +425,6 @@ router.get('/user-stats', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ message: 'Error fetching user stats', error: error.message });
-  }
-});
-
-// Like a word
-router.post('/words/:wordId/like', authenticateToken, async (req, res) => {
-  try {
-    const word = await Word.findById(req.params.wordId);
-    
-    if (!word) {
-      return res.status(404).json({ message: 'Word not found' });
-    }
-    
-    // Check if user already liked this word
-    if (word.likedBy.includes(req.user.userId)) {
-      return res.status(400).json({ message: 'You already liked this word' });
-    }
-    
-    // Add like
-    word.likes += 1;
-    word.likedBy.push(req.user.userId);
-    await word.save();
-    
-    res.json({ 
-      message: 'Word liked successfully',
-      likes: word.likes,
-      liked: true
-    });
-  } catch (error) {
-    console.error('Like word error:', error);
-    res.status(500).json({ message: 'Error liking word', error: error.message });
-  }
-});
-
-// Unlike a word
-router.delete('/words/:wordId/like', authenticateToken, async (req, res) => {
-  try {
-    const word = await Word.findById(req.params.wordId);
-    
-    if (!word) {
-      return res.status(404).json({ message: 'Word not found' });
-    }
-    
-    // Check if user has liked this word
-    const likeIndex = word.likedBy.indexOf(req.user.userId);
-    if (likeIndex === -1) {
-      return res.status(400).json({ message: 'You haven\'t liked this word' });
-    }
-    
-    // Remove like
-    word.likes -= 1;
-    word.likedBy.splice(likeIndex, 1);
-    await word.save();
-    
-    res.json({ 
-      message: 'Like removed successfully',
-      likes: word.likes,
-      liked: false
-    });
-  } catch (error) {
-    console.error('Unlike word error:', error);
-    res.status(500).json({ message: 'Error unliking word', error: error.message });
   }
 });
 
@@ -463,63 +449,7 @@ router.get('/words/:wordId/like-status', authenticateToken, async (req, res) => 
   }
 });
 
-// Update the DELETE endpoint for words
-// Delete word by position using linked list
-router.delete('/words/:position', authenticateToken, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.userId);
-    const isAdmin = user.username === 'admin';
-    const position = parseInt(req.params.position);
-    
-    // Get the word to check ownership and likes
-    const word = await linkedListService.getWordByOrder(position);
-    if (!word) {
-      return res.status(404).json({ message: 'Word not found' });
-    }
-    
-    // Don't allow deleting own words for non-admin users
-    if (!isAdmin && word.author.toString() === req.user.userId) {
-      return res.status(403).json({ message: 'Cannot delete your own words' });
-    }
-    
-    // Get latest stats for cost calculation
-    const stats = await Stats.findOne();
-    let deletionCost = 1;
-    
-    if (stats && !isAdmin) {
-      deletionCost = getDeletionCost(word.likes, stats.averageLikes, stats.stdDeviation);
-    }
-    
-    // Check if user has enough credits (non-admin only)
-    if (!isAdmin && user.deleteCredits < deletionCost) {
-      return res.status(403).json({ 
-        message: `Not enough credits. This word costs ${deletionCost} credit(s) to delete. You have ${user.deleteCredits} credits.`,
-        requiredCredits: deletionCost,
-        availableCredits: user.deleteCredits
-      });
-    }
-    
-    // Delete using linked list
-    await linkedListService.deleteWordAtPosition(position);
-    
-    // Update user's delete credits (only for non-admin)
-    if (!isAdmin) {
-      user.deleteCredits -= deletionCost;
-      await user.save();
-    }
-    
-    res.json({ 
-      message: 'Word deleted successfully', 
-      remainingCredits: isAdmin ? 'unlimited' : user.deleteCredits,
-      cost: deletionCost
-    });
-  } catch (error) {
-    console.error('Delete word error:', error);
-    res.status(500).json({ message: 'Error deleting word', error: error.message });
-  }
-});
-
-// Add endpoint to get deletion cost for a word
+// Get deletion cost for a word
 router.get('/words/:wordId/deletion-cost', authenticateToken, async (req, res) => {
   try {
     const word = await Word.findById(req.params.wordId);
@@ -549,7 +479,7 @@ router.get('/words/:wordId/deletion-cost', authenticateToken, async (req, res) =
   }
 });
 
-// Get word count (efficient)
+// Get word count
 router.get('/word-count', async (req, res) => {
   try {
     const count = await linkedListService.getWordCount();
@@ -559,18 +489,255 @@ router.get('/word-count', async (req, res) => {
   }
 });
 
-// Get paginated words
-router.get('/words/range', async (req, res) => {
-  try {
-    const start = parseInt(req.query.start) || 0;
-    const limit = parseInt(req.query.limit) || 100;
-    
-    const words = await linkedListService.getWordRange(start, limit);
-    res.json(words);
-  } catch (error) {
-    res.status(500).json({ message: 'Error fetching word range', error: error.message });
+// ==================== POST ROUTES ====================
+
+// Add a word - supports insertAfter, insertBefore, or append
+router.post('/words', 
+  authenticateToken, 
+  idempotencyMiddleware,
+  async (req, res) => {
+    try {
+      const { text, insertAfterWordId, insertBeforeWordId } = req.body;
+      
+      if (!text || text.trim().split(/\s+/).length !== 1) {
+        return res.status(400).json({ message: 'Only single words allowed' });
+      }
+      
+      let newWord;
+      
+      // Determine insertion method
+      if (insertAfterWordId !== undefined && insertAfterWordId !== null) {
+        // Insert after specific word
+        newWord = await linkedListService.insertWordAfter({
+          text: text.trim(),
+          author: req.user.userId,
+          authorName: req.user.username
+        }, insertAfterWordId);
+      } else if (insertBeforeWordId !== undefined && insertBeforeWordId !== null) {
+        // Insert before specific word
+        newWord = await linkedListService.insertWordBefore({
+          text: text.trim(),
+          author: req.user.userId,
+          authorName: req.user.username
+        }, insertBeforeWordId);
+      } else {
+        // Append to end (default)
+        newWord = await linkedListService.appendWord({
+          text: text.trim(),
+          author: req.user.userId,
+          authorName: req.user.username
+        });
+      }
+      
+      // Update user's word count
+      const user = await User.findById(req.user.userId);
+      user.wordsWritten += 1;
+      
+      if (user.username !== 'admin') {
+        if (user.wordsWritten % 3 === 0) {
+          user.deleteCredits += 2;
+        }
+      } else {
+        user.deleteCredits = 999999;
+      }
+      
+      await user.save();
+      
+      // Return idempotency key if present
+      const idempotencyKey = req.headers['idempotency-key'];
+      if (idempotencyKey) {
+        res.setHeader('X-Idempotency-Key', idempotencyKey);
+      }
+      
+      res.status(201).json({
+        ...newWord.toObject(),
+        idempotencyKey: idempotencyKey
+      });
+    } catch (error) {
+      console.error('Add word error:', error);
+      res.status(500).json({ message: 'Error adding word', error: error.message });
+    }
   }
-});
+);
+
+// Like a word
+router.post('/words/:wordId/like', 
+  authenticateToken, 
+  idempotencyMiddleware,
+  async (req, res) => {
+    try {
+      const word = await Word.findById(req.params.wordId);
+      
+      if (!word) {
+        return res.status(404).json({ message: 'Word not found' });
+      }
+      
+      // Check if user already liked this word
+      if (word.likedBy.includes(req.user.userId)) {
+        return res.status(400).json({ message: 'You already liked this word' });
+      }
+      
+      // Add like
+      word.likes += 1;
+      word.likedBy.push(req.user.userId);
+      await word.save();
+      
+      const idempotencyKey = req.headers['idempotency-key'];
+      if (idempotencyKey) {
+        res.setHeader('X-Idempotency-Key', idempotencyKey);
+      }
+      
+      res.json({ 
+        message: 'Word liked successfully',
+        likes: word.likes,
+        liked: true,
+        idempotencyKey: idempotencyKey
+      });
+    } catch (error) {
+      console.error('Like word error:', error);
+      res.status(500).json({ message: 'Error liking word', error: error.message });
+    }
+  }
+);
+
+// ==================== DELETE ROUTES ====================
+
+// Delete all words (admin only)
+router.delete('/words', 
+  authenticateToken, 
+  idempotencyMiddleware,
+  async (req, res) => {
+    try {
+      const user = await User.findById(req.user.userId);
+      
+      if (user.username !== 'admin') {
+        return res.status(403).json({ message: 'Admin access required' });
+      }
+      
+      const deletedCount = await Word.countDocuments();
+      await Word.deleteMany({});
+      
+      const idempotencyKey = req.headers['idempotency-key'];
+      if (idempotencyKey) {
+        res.setHeader('X-Idempotency-Key', idempotencyKey);
+      }
+      
+      res.json({ 
+        message: 'All words deleted successfully', 
+        deletedCount: deletedCount,
+        idempotencyKey: idempotencyKey
+      });
+    } catch (error) {
+      console.error('Delete all words error:', error);
+      res.status(500).json({ message: 'Error deleting all words', error: error.message });
+    }
+  }
+);
+
+// Delete word by ID
+router.delete('/words/:wordId', 
+  authenticateToken, 
+  idempotencyMiddleware,
+  async (req, res) => {
+    try {
+      const user = await User.findById(req.user.userId);
+      const isAdmin = user.username === 'admin';
+      const wordId = req.params.wordId;
+      
+      // Get the word to check ownership and likes
+      const word = await Word.findById(wordId);
+      if (!word) {
+        return res.status(404).json({ message: 'Word not found' });
+      }
+      
+      // Don't allow deleting own words for non-admin users
+      if (!isAdmin && word.author.toString() === req.user.userId) {
+        return res.status(403).json({ message: 'Cannot delete your own words' });
+      }
+      
+      // Get latest stats for cost calculation
+      const stats = await Stats.findOne();
+      let deletionCost = 1;
+      
+      if (stats && !isAdmin) {
+        deletionCost = getDeletionCost(word.likes, stats.averageLikes, stats.stdDeviation);
+      }
+      
+      // Check if user has enough credits (non-admin only)
+      if (!isAdmin && user.deleteCredits < deletionCost) {
+        return res.status(403).json({ 
+          message: `Not enough credits. This word costs ${deletionCost} credit(s) to delete. You have ${user.deleteCredits} credits.`,
+          requiredCredits: deletionCost,
+          availableCredits: user.deleteCredits
+        });
+      }
+      
+      // Delete using linked list
+      await linkedListService.deleteWordById(wordId);
+      
+      // Update user's delete credits (only for non-admin)
+      if (!isAdmin) {
+        user.deleteCredits -= deletionCost;
+        await user.save();
+      }
+      
+      const idempotencyKey = req.headers['idempotency-key'];
+      if (idempotencyKey) {
+        res.setHeader('X-Idempotency-Key', idempotencyKey);
+      }
+      
+      res.json({ 
+        message: 'Word deleted successfully', 
+        remainingCredits: isAdmin ? 'unlimited' : user.deleteCredits,
+        cost: deletionCost,
+        deletedWordId: wordId,
+        idempotencyKey: idempotencyKey
+      });
+    } catch (error) {
+      console.error('Delete word error:', error);
+      res.status(500).json({ message: 'Error deleting word', error: error.message });
+    }
+  }
+);
+
+// Unlike a word
+router.delete('/words/:wordId/like', 
+  authenticateToken, 
+  idempotencyMiddleware,
+  async (req, res) => {
+    try {
+      const word = await Word.findById(req.params.wordId);
+      
+      if (!word) {
+        return res.status(404).json({ message: 'Word not found' });
+      }
+      
+      const likeIndex = word.likedBy.indexOf(req.user.userId);
+      if (likeIndex === -1) {
+        return res.status(400).json({ message: 'You haven\'t liked this word' });
+      }
+      
+      word.likes -= 1;
+      word.likedBy.splice(likeIndex, 1);
+      await word.save();
+      
+      const idempotencyKey = req.headers['idempotency-key'];
+      if (idempotencyKey) {
+        res.setHeader('X-Idempotency-Key', idempotencyKey);
+      }
+      
+      res.json({ 
+        message: 'Like removed successfully',
+        likes: word.likes,
+        liked: false,
+        idempotencyKey: idempotencyKey
+      });
+    } catch (error) {
+      console.error('Unlike word error:', error);
+      res.status(500).json({ message: 'Error unliking word', error: error.message });
+    }
+  }
+);
 
 export default router;
 
@@ -698,6 +865,7 @@ server.listen(PORT, () => {
 FILE: backend/services/linkedListService.js
 ================================================================================
 
+// backend/services/linkedListService.js
 import Word from '../models/Word.js';
 
 class LinkedListService {
@@ -711,7 +879,7 @@ class LinkedListService {
     return await Word.findOne({ nextWord: null }).populate('author', 'username');
   }
 
-  // Get entire book in order
+  // Get entire book in order (no position numbers needed anymore)
   async getBookInOrder() {
     const allWords = await Word.find().lean();
     const wordMap = new Map();
@@ -719,11 +887,12 @@ class LinkedListService {
     
     const orderedWords = [];
     let current = await this.getHead();
-    let maxIterations = 10000; // Safety limit
+    let maxIterations = 10000;
     let iterations = 0;
     
     while (current && iterations < maxIterations) {
-      orderedWords.push(current);
+      orderedWords.push(current.toObject ? current.toObject() : current);
+      
       if (current.nextWord) {
         current = wordMap.get(current.nextWord.toString());
       } else {
@@ -735,12 +904,12 @@ class LinkedListService {
     return orderedWords;
   }
 
-  // Insert word at specific position (without transactions)
-  async insertWordAtPosition(wordData, position) {
+  // Insert after a specific word (by ID)
+  async insertWordAfter(wordData, afterWordId) {
     try {
       const newWord = new Word(wordData);
       
-      if (position === 0) {
+      if (afterWordId === null) {
         // Insert at beginning
         const oldHead = await this.getHead();
         newWord.nextWord = oldHead ? oldHead._id : null;
@@ -753,40 +922,29 @@ class LinkedListService {
         
         await newWord.save();
       } else {
-        // Insert at position or end
-        const prevWord = await this.getWordByOrder(position - 1);
-        
-        if (prevWord) {
-          newWord.prevWord = prevWord._id;
-          newWord.nextWord = prevWord.nextWord;
-          
-          // Update next word's prev pointer
-          if (prevWord.nextWord) {
-            const nextWord = await Word.findById(prevWord.nextWord);
-            if (nextWord) {
-              nextWord.prevWord = newWord._id;
-              await nextWord.save();
-            }
-          }
-          
-          prevWord.nextWord = newWord._id;
-          await prevWord.save();
-        } else {
-          // Append to end
-          const tail = await this.getTail();
-          if (tail) {
-            newWord.prevWord = tail._id;
-            tail.nextWord = newWord._id;
-            await tail.save();
-          }
-          newWord.nextWord = null;
+        // Insert after specific word
+        const afterWord = await Word.findById(afterWordId);
+        if (!afterWord) {
+          throw new Error('Reference word not found');
         }
         
+        newWord.prevWord = afterWord._id;
+        newWord.nextWord = afterWord.nextWord;
+        
+        // Update the next word's prev pointer
+        if (afterWord.nextWord) {
+          const nextWord = await Word.findById(afterWord.nextWord);
+          if (nextWord) {
+            nextWord.prevWord = newWord._id;
+            await nextWord.save();
+          }
+        }
+        
+        // Update the after word's next pointer
+        afterWord.nextWord = newWord._id;
+        await afterWord.save();
         await newWord.save();
       }
-      
-      // Update order numbers asynchronously (don't wait)
-      this.recalculateOrders().catch(console.error);
       
       return newWord;
     } catch (error) {
@@ -795,10 +953,65 @@ class LinkedListService {
     }
   }
 
-  // Delete word at position (without transactions)
-  async deleteWordAtPosition(position) {
+  // Insert before a specific word (by ID)
+  async insertWordBefore(wordData, beforeWordId) {
     try {
-      const wordToDelete = await this.getWordByOrder(position);
+      const newWord = new Word(wordData);
+      const beforeWord = await Word.findById(beforeWordId);
+      
+      if (!beforeWord) {
+        throw new Error('Reference word not found');
+      }
+      
+      newWord.prevWord = beforeWord.prevWord;
+      newWord.nextWord = beforeWord._id;
+      
+      // Update the previous word's next pointer
+      if (beforeWord.prevWord) {
+        const prevWord = await Word.findById(beforeWord.prevWord);
+        if (prevWord) {
+          prevWord.nextWord = newWord._id;
+          await prevWord.save();
+        }
+      }
+      
+      // Update the before word's prev pointer
+      beforeWord.prevWord = newWord._id;
+      await beforeWord.save();
+      await newWord.save();
+      
+      return newWord;
+    } catch (error) {
+      console.error('Error inserting word:', error);
+      throw error;
+    }
+  }
+
+  // Append to end
+  async appendWord(wordData) {
+    try {
+      const newWord = new Word(wordData);
+      const tail = await this.getTail();
+      
+      if (tail) {
+        newWord.prevWord = tail._id;
+        tail.nextWord = newWord._id;
+        await tail.save();
+      }
+      newWord.nextWord = null;
+      
+      await newWord.save();
+      return newWord;
+    } catch (error) {
+      console.error('Error appending word:', error);
+      throw error;
+    }
+  }
+
+  // Delete word by ID
+  async deleteWordById(wordId) {
+    try {
+      const wordToDelete = await Word.findById(wordId);
       if (!wordToDelete) {
         throw new Error('Word not found');
       }
@@ -821,10 +1034,6 @@ class LinkedListService {
       }
       
       await wordToDelete.deleteOne();
-      
-      // Update order numbers asynchronously
-      this.recalculateOrders().catch(console.error);
-      
       return true;
     } catch (error) {
       console.error('Error deleting word:', error);
@@ -832,94 +1041,31 @@ class LinkedListService {
     }
   }
 
-  // Get word by order (using cached order field or traversal)
-  async getWordByOrder(targetOrder) {
-    // First try using cached order field
-    const wordWithOrder = await Word.findOne({ order: targetOrder });
-    if (wordWithOrder) return wordWithOrder;
-    
-    // Fallback to traversal
-    let current = await this.getHead();
-    let currentOrder = 0;
-    
-    while (current) {
-      if (currentOrder === targetOrder) {
-        return current;
-      }
-      current = current.nextWord ? await Word.findById(current.nextWord) : null;
-      currentOrder++;
-    }
-    
-    return null;
-  }
-
-  // Recalculate order numbers for caching
-  async recalculateOrders() {
-    let current = await this.getHead();
-    let order = 0;
-    let updates = [];
-    
-    while (current) {
-      if (current.order !== order) {
-        current.order = order;
-        updates.push(current.save());
-      }
-      current = current.nextWord ? await Word.findById(current.nextWord) : null;
-      order++;
-    }
-    
-    await Promise.all(updates);
-    console.log(`✅ Recalculated orders for ${order} words`);
-  }
-
   // Get word count efficiently
   async getWordCount() {
     return await Word.countDocuments();
   }
 
-  // Get range of words (for pagination)
-  async getWordRange(startPosition, count) {
-    const startWord = await this.getWordByOrder(startPosition);
-    if (!startWord) return [];
-    
-    const words = [];
-    let current = startWord;
-    let fetched = 0;
-    let maxIterations = count * 2; // Safety limit
-    
-    while (current && fetched < count && fetched < maxIterations) {
-      words.push(current);
-      current = current.nextWord ? await Word.findById(current.nextWord) : null;
-      fetched++;
-    }
-    
-    return words;
-  }
-
-  // Get word by ID with its order
-  async getWordWithOrder(wordId) {
+  // Get word by ID with context (neighbors)
+  async getWordWithContext(wordId) {
     const word = await Word.findById(wordId);
     if (!word) return null;
     
-    if (word.order !== undefined && word.order !== null) {
-      return word;
+    let prevWord = null;
+    let nextWord = null;
+    
+    if (word.prevWord) {
+      prevWord = await Word.findById(word.prevWord);
+    }
+    if (word.nextWord) {
+      nextWord = await Word.findById(word.nextWord);
     }
     
-    // Calculate order if not cached
-    let current = await this.getHead();
-    let order = 0;
-    
-    while (current) {
-      if (current._id.toString() === wordId) {
-        word.order = order;
-        await word.save();
-        return word;
-      }
-      current = current.nextWord ? await Word.findById(current.nextWord) : null;
-      order++;
-    }
-    
-    return null;
+    return {
+      word,
+      prevWord,
+      nextWord
+    };
   }
 }
 
@@ -1086,7 +1232,7 @@ defineProps({
 FILE: frontend/src/components/WordInput.vue
 ================================================================================
 
-[STRIPPED: 825 bytes of style content]
+[STRIPPED: 842 bytes of style content]
 
 <!-- components/WordInput.vue -->
 <template>
@@ -1141,7 +1287,7 @@ const placeholder = computed(() => {
   if (props.mode === 'inline' && props.insertPosition !== null) {
     return `Insert at position ${props.insertPosition}...`
   }
-  return 'Type a word...'
+  return ''
 })
 
 // Handle click outside
@@ -1316,6 +1462,45 @@ app.mount('#app')
 
 
 ================================================================================
+FILE: frontend/src/plugins/axios.js
+================================================================================
+
+// frontend/src/plugins/axios.js
+import axios from 'axios';
+import { generateIdempotencyKey, idempotencyTracker } from '../utils/idempotency';
+
+// Auto-add idempotency keys to all state-changing requests
+axios.interceptors.request.use(config => {
+  // Only add to state-changing methods
+  const stateChangingMethods = ['post', 'put', 'patch', 'delete'];
+  
+  if (stateChangingMethods.includes(config.method?.toLowerCase())) {
+    // Skip if idempotency key already exists
+    if (!config.headers['Idempotency-Key']) {
+      // Generate a key based on method, URL, and body
+      const keyData = `${config.method}:${config.url}:${JSON.stringify(config.data || {})}`;
+      const idempotencyKey = generateIdempotencyKey('auto', Buffer.from(keyData).toString('base64').substring(0, 50));
+      config.headers['Idempotency-Key'] = idempotencyKey;
+    }
+  }
+  
+  return config;
+});
+
+// Handle idempotency responses
+axios.interceptors.response.use(
+  response => response,
+  error => {
+    if (error.response?.status === 409) {
+      console.warn('Idempotency conflict:', error.response.data);
+      // You could show a user-friendly message here
+    }
+    return Promise.reject(error);
+  }
+);
+
+
+================================================================================
 FILE: frontend/src/router/index.js
 ================================================================================
 
@@ -1429,16 +1614,19 @@ export const useAuthStore = defineStore('auth', {
 FILE: frontend/src/stores/book.js
 ================================================================================
 
-// stores/book.js
-
+// frontend/src/stores/book.js
 import { defineStore } from 'pinia'
 import axios from 'axios'
+import { generateIdempotencyKey, idempotencyTracker } from '../utils/idempotency'
 
 export const useBookStore = defineStore('book', {
   state: () => ({
     words: [],
     loading: false,
-    error: null
+    error: null,
+    isDeleting: false,
+    isAdding: false,
+    isLiking: false
   }),
   
   getters: {
@@ -1447,146 +1635,356 @@ export const useBookStore = defineStore('book', {
   },
   
   actions: {
-// frontend/src/stores/book.js - Add method to get deletion cost
-async getDeletionCost(wordId) {
-  try {
-    const response = await axios.get(`/api/book/words/${wordId}/deletion-cost`);
-    return response.data;
-  } catch (error) {
-    console.error('Error getting deletion cost:', error);
-    return { cost: 1, likes: 0 };
-  }
-},
-    
-// stores/book.js
-// stores/book.js
-
-async addWord(wordText, insertAtPosition = null) {
-  try {
-    const payload = { text: wordText };
-    if (insertAtPosition !== null && insertAtPosition !== undefined) {
-      payload.insertAtPosition = insertAtPosition;
-    }
-    
-    const response = await axios.post('/api/book/words', payload);
-    
-    // Refetch all words to get updated positions
-    await this.fetchWords();
-    
-    return { success: true, word: response.data };
-  } catch (error) {
-    return { success: false, message: error.response?.data?.message || 'Failed to add word' };
-  }
-},
-    
-    async deleteWord(position) {
+    async getDeletionCost(wordId) {
       try {
-        const response = await axios.delete(`/api/book/words/${position}`)
-        this.words = this.words.filter(w => w.position !== position)
-        // Update positions of words after the deleted one
-        this.words.forEach(word => {
-          if (word.position > position) {
-            word.position -= 1
-          }
-        })
-        return { success: true, credits: response.data.remainingCredits }
+        const response = await axios.get(`/api/book/words/${wordId}/deletion-cost`);
+        return response.data;
       } catch (error) {
-        return { success: false, message: error.response?.data?.message || 'Failed to delete word' }
+        console.error('Error getting deletion cost:', error);
+        return { cost: 1, likes: 0 };
+      }
+    },
+    
+    // Add word with insertion options
+    async addWord(wordText, options = {}) {
+      if (this.isAdding) {
+        return { success: false, message: 'Already adding a word, please wait...' };
+      }
+      
+      this.isAdding = true;
+      
+      // Generate idempotency key based on operation
+      const operationKey = options.insertAfterWordId || options.insertBeforeWordId || 'append';
+      const idempotencyKey = generateIdempotencyKey('add-word', `${wordText}-${operationKey}`);
+      
+      if (idempotencyTracker.isPending(idempotencyKey)) {
+        this.isAdding = false;
+        return { success: false, message: 'This word is already being added' };
+      }
+      
+      idempotencyTracker.addPending(idempotencyKey);
+      
+      try {
+        const payload = { text: wordText };
+        if (options.insertAfterWordId) {
+          payload.insertAfterWordId = options.insertAfterWordId;
+        } else if (options.insertBeforeWordId) {
+          payload.insertBeforeWordId = options.insertBeforeWordId;
+        }
+        
+        const response = await axios.post('/api/book/words', payload, {
+          headers: {
+            'Idempotency-Key': idempotencyKey
+          }
+        });
+        
+        await this.fetchWords();
+        
+        return { success: true, word: response.data };
+      } catch (error) {
+        if (error.response?.status === 409) {
+          console.log('Duplicate add request detected');
+          await this.fetchWords();
+          return { success: true, message: 'Word was already added' };
+        }
+        
+        return { success: false, message: error.response?.data?.message || 'Failed to add word' };
+      } finally {
+        this.isAdding = false;
+        idempotencyTracker.removePending(idempotencyKey);
+      }
+    },
+    
+    // Delete word by ID
+    async deleteWordById(wordId) {
+      if (this.isDeleting) {
+        return { success: false, message: 'Another deletion is in progress, please wait...' };
+      }
+      
+      this.isDeleting = true;
+      
+      const idempotencyKey = generateIdempotencyKey('delete-word', wordId);
+      
+      if (idempotencyTracker.isPending(idempotencyKey)) {
+        this.isDeleting = false;
+        return { success: false, message: 'This word is already being deleted' };
+      }
+      
+      idempotencyTracker.addPending(idempotencyKey);
+      
+      try {
+        const response = await axios.delete(`/api/book/words/${wordId}`, {
+          headers: {
+            'Idempotency-Key': idempotencyKey
+          }
+        });
+        
+        // Update local state - remove the deleted word
+        const deletedIndex = this.words.findIndex(w => w._id === wordId);
+        if (deletedIndex !== -1) {
+          this.words.splice(deletedIndex, 1);
+        }
+        
+        return { 
+          success: true, 
+          credits: response.data.remainingCredits,
+          cost: response.data.cost,
+          deletedWordId: wordId
+        };
+      } catch (error) {
+        if (error.response?.status === 409) {
+          console.log('Duplicate delete request detected');
+          return { 
+            success: false, 
+            message: 'This word has already been deleted',
+            alreadyDeleted: true
+          };
+        }
+        
+        return { 
+          success: false, 
+          message: error.response?.data?.message || 'Failed to delete word' 
+        };
+      } finally {
+        this.isDeleting = false;
+        idempotencyTracker.removePending(idempotencyKey);
+      }
+    },
+    
+    // Like word
+    async likeWord(wordId) {
+      if (this.isLiking) {
+        return { success: false, message: 'Please wait, finishing previous like operation...' };
+      }
+      
+      this.isLiking = true;
+      
+      const idempotencyKey = generateIdempotencyKey('like-word', wordId);
+      
+      if (idempotencyTracker.isPending(idempotencyKey)) {
+        this.isLiking = false;
+        return { success: false, message: 'Already processing this like' };
+      }
+      
+      idempotencyTracker.addPending(idempotencyKey);
+      
+      try {
+        const response = await axios.post(`/api/book/words/${wordId}/like`, {}, {
+          headers: {
+            'Idempotency-Key': idempotencyKey
+          }
+        });
+        
+        const word = this.words.find(w => w._id === wordId);
+        if (word) {
+          word.likes = response.data.likes;
+          word.userLiked = true;
+        }
+        
+        return { success: true, likes: response.data.likes };
+      } catch (error) {
+        if (error.response?.status === 409) {
+          console.log('Duplicate like request detected');
+          return { success: false, message: 'You already liked this word' };
+        }
+        
+        return { success: false, message: error.response?.data?.message || 'Failed to like word' };
+      } finally {
+        this.isLiking = false;
+        idempotencyTracker.removePending(idempotencyKey);
+      }
+    },
+    
+    // Unlike word
+    async unlikeWord(wordId) {
+      if (this.isLiking) {
+        return { success: false, message: 'Please wait, finishing previous operation...' };
+      }
+      
+      this.isLiking = true;
+      
+      const idempotencyKey = generateIdempotencyKey('unlike-word', wordId);
+      
+      if (idempotencyTracker.isPending(idempotencyKey)) {
+        this.isLiking = false;
+        return { success: false, message: 'Already processing this unlike' };
+      }
+      
+      idempotencyTracker.addPending(idempotencyKey);
+      
+      try {
+        const response = await axios.delete(`/api/book/words/${wordId}/like`, {
+          headers: {
+            'Idempotency-Key': idempotencyKey
+          }
+        });
+        
+        const word = this.words.find(w => w._id === wordId);
+        if (word) {
+          word.likes = response.data.likes;
+          word.userLiked = false;
+        }
+        
+        return { success: true, likes: response.data.likes };
+      } catch (error) {
+        if (error.response?.status === 409) {
+          console.log('Duplicate unlike request detected');
+          return { success: false, message: 'You already unliked this word' };
+        }
+        
+        return { success: false, message: error.response?.data?.message || 'Failed to unlike word' };
+      } finally {
+        this.isLiking = false;
+        idempotencyTracker.removePending(idempotencyKey);
+      }
+    },
+    
+    async checkLikeStatus(wordId) {
+      try {
+        const response = await axios.get(`/api/book/words/${wordId}/like-status`);
+        return response.data;
+      } catch (error) {
+        console.error('Error checking like status:', error);
+        return { liked: false, likes: 0 };
       }
     },
     
     async deleteAllWords() {
+      if (this.isDeleting) {
+        return { success: false, message: 'A deletion is already in progress' };
+      }
+      
+      this.isDeleting = true;
+      
+      const idempotencyKey = generateIdempotencyKey('delete-all-words', Date.now().toString());
+      
+      if (idempotencyTracker.isPending(idempotencyKey)) {
+        this.isDeleting = false;
+        return { success: false, message: 'Delete all operation already in progress' };
+      }
+      
+      idempotencyTracker.addPending(idempotencyKey);
+      
       try {
-        const response = await axios.delete('/api/book/words')
-        this.words = []
-        return { success: true, deletedCount: response.data.deletedCount }
+        const response = await axios.delete('/api/book/words', {
+          headers: {
+            'Idempotency-Key': idempotencyKey
+          }
+        });
+        
+        this.words = [];
+        return { success: true, deletedCount: response.data.deletedCount };
       } catch (error) {
-        return { success: false, message: error.response?.data?.message || 'Failed to delete all words' }
+        if (error.response?.status === 409) {
+          console.log('Duplicate delete all request detected');
+          return { success: false, message: 'Delete all operation already performed' };
+        }
+        
+        return { success: false, message: error.response?.data?.message || 'Failed to delete all words' };
+      } finally {
+        this.isDeleting = false;
+        idempotencyTracker.removePending(idempotencyKey);
       }
     },
-// Add these actions to your existing book store
-
-async likeWord(wordId) {
-  try {
-    const response = await axios.post(`/api/book/words/${wordId}/like`);
     
-    // Update the word in the local store
-    const word = this.words.find(w => w._id === wordId);
-    if (word) {
-      word.likes = response.data.likes;
-      word.userLiked = true;
-    }
-    
-    return { success: true, likes: response.data.likes };
-  } catch (error) {
-    return { success: false, message: error.response?.data?.message || 'Failed to like word' };
-  }
-},
-
-async unlikeWord(wordId) {
-  try {
-    const response = await axios.delete(`/api/book/words/${wordId}/like`);
-    
-    // Update the word in the local store
-    const word = this.words.find(w => w._id === wordId);
-    if (word) {
-      word.likes = response.data.likes;
-      word.userLiked = false;
-    }
-    
-    return { success: true, likes: response.data.likes };
-  } catch (error) {
-    return { success: false, message: error.response?.data?.message || 'Failed to unlike word' };
-  }
-},
-
-async checkLikeStatus(wordId) {
-  try {
-    const response = await axios.get(`/api/book/words/${wordId}/like-status`);
-    return response.data;
-  } catch (error) {
-    console.error('Error checking like status:', error);
-    return { liked: false, likes: 0 };
-  }
-},
-
-// Modify fetchWords to include user like status
-async fetchWords() {
-  this.loading = true
-  try {
-    const response = await axios.get('/api/book/words')
-    this.words = response.data
-    
-    // If user is authenticated, check like status for each word
-    const token = localStorage.getItem('token')
-    if (token) {
-      for (const word of this.words) {
-        const likeStatus = await this.checkLikeStatus(word._id)
-        word.userLiked = likeStatus.liked
-        word.likes = likeStatus.likes
+    async fetchWords() {
+      this.loading = true;
+      try {
+        const response = await axios.get('/api/book/words');
+        this.words = response.data;
+        
+        const token = localStorage.getItem('token');
+        if (token) {
+          const batchSize = 20;
+          for (let i = 0; i < this.words.length; i += batchSize) {
+            const batch = this.words.slice(i, i + batchSize);
+            await Promise.all(
+              batch.map(async (word) => {
+                const likeStatus = await this.checkLikeStatus(word._id);
+                word.userLiked = likeStatus.liked;
+                word.likes = likeStatus.likes;
+              })
+            );
+          }
+        }
+        
+        this.error = null;
+      } catch (error) {
+        this.error = 'Failed to load the book';
+        console.error(error);
+      } finally {
+        this.loading = false;
       }
     }
-    
-    this.error = null
-  } catch (error) {
-    this.error = 'Failed to load the book'
-    console.error(error)
-  } finally {
-    this.loading = false
+  }
+});
+
+
+================================================================================
+FILE: frontend/src/utils/idempotency.js
+================================================================================
+
+// frontend/src/utils/idempotency.js
+
+/**
+ * Generates a unique idempotency key for requests
+ * @param {string} operation - The operation type (e.g., 'delete-word', 'add-word', 'like-word')
+ * @param {string} id - The resource ID or position
+ * @returns {string} Unique idempotency key
+ */
+export const generateIdempotencyKey = (operation, id) => {
+  const timestamp = Date.now();
+  const random = Math.random().toString(36).substring(2, 15);
+  const sessionId = localStorage.getItem('sessionId') || generateSessionId();
+  
+  return `${sessionId}-${operation}-${id}-${timestamp}-${random}`;
+};
+
+/**
+ * Generate a persistent session ID for this browser tab
+ */
+const generateSessionId = () => {
+  const sessionId = `${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
+  localStorage.setItem('sessionId', sessionId);
+  return sessionId;
+};
+
+/**
+ * Store for tracking in-flight requests to prevent duplicates at UI level
+ */
+class IdempotencyTracker {
+  constructor() {
+    this.pendingRequests = new Map();
+  }
+  
+  isPending(key) {
+    return this.pendingRequests.has(key);
+  }
+  
+  addPending(key) {
+    this.pendingRequests.set(key, true);
+    // Auto-clear after 10 seconds (in case something goes wrong)
+    setTimeout(() => {
+      this.pendingRequests.delete(key);
+    }, 10000);
+  }
+  
+  removePending(key) {
+    this.pendingRequests.delete(key);
   }
 }
-  }
-})
+
+export const idempotencyTracker = new IdempotencyTracker();
 
 
 ================================================================================
 FILE: frontend/src/views/Book.vue
 ================================================================================
 
-[STRIPPED: 7169 bytes of style content]
+[STRIPPED: 8112 bytes of style content]
 
 <template>
-  <div class="book-container">
+  <div class="book-container" :class="{ 'deleting-active': deletionLock || bookStore.isDeleting }">
     <header class="header">
       <div class="header-left">
         <h1>📖 Collaborative Book</h1>
@@ -1614,7 +2012,6 @@ FILE: frontend/src/views/Book.vue
           Cancel Delete Mode
         </button>
         
-        <!-- Admin Delete All Words Button -->
         <button 
           v-if="isAdmin" 
           @click="confirmDeleteAllWords" 
@@ -1624,18 +2021,28 @@ FILE: frontend/src/views/Book.vue
           ⚠️ Delete All Words
         </button>
         
-        <button v-if="activeInsertPosition !== null" @click="cancelInsertMode" class="cancel-btn">
+        <button v-if="activeInsertMode" @click="cancelInsertMode" class="cancel-btn">
           Cancel Insert Mode
         </button>
         
         <div class="info" v-if="deleteMode">
-          Click on any word (not yours) to delete it (costs 1 credit)
+          Click on any word (not yours) to delete it
         </div>
-        <div class="insert-info" v-if="activeInsertPosition !== null">
-          📍 Inserting at position {{ activeInsertPosition }}. Type your word and press Enter/Space
+        <div class="insert-info" v-if="activeInsertMode && activeInsertRefWord">
+          📍 Inserting {{ activeInsertMode === 'after' ? 'after' : 'before' }} "{{ activeInsertRefWord.text }}". Type your word and press Enter/Space
+        </div>
+        <div class="insert-info" v-if="activeInsertMode && !activeInsertRefWord">
+          📍 Inserting at {{ activeInsertMode === 'after' ? 'end' : 'beginning' }}. Type your word and press Enter/Space
         </div>
         <div class="admin-info" v-if="isAdmin">
           🔧 Admin Mode: Unlimited delete credits
+        </div>
+        
+        <div v-if="bookStore.isAdding || isAddingWord" class="status-indicator">
+          Adding word...
+        </div>
+        <div v-if="bookStore.isLiking || isLikingWord" class="status-indicator">
+          Processing like...
         </div>
       </div>
 
@@ -1653,99 +2060,108 @@ FILE: frontend/src/views/Book.vue
           ref="editorRef"
         >
           <div class="words-wrapper">
-            <!-- Insert at beginning -->
+            <!-- Insert at beginning indicator - only show when not in insert mode -->
             <span 
-              v-if="!deleteMode && activeInsertPosition !== 0" 
+              v-if="!deleteMode && !(activeInsertMode === 'before' && activeInsertRefWord === null)" 
               class="insert-indicator insert-beginning"
-              @click.stop="activateInsertAt(0)"
+              @click.stop="activateInsertBefore(null)"
               title="Insert at beginning"
             >
               ⬅️ Insert here
             </span>
             
-            <template v-for="word in bookStore.words" :key="word.id">
-              <!-- Inline input component at specific position -->
-              <WordInput
-                v-if="activeInsertPosition === word.position"
-                mode="inline"
-                :insert-position="word.position"
-                :is-active="true"
-                :auto-focus="true"
-                @submit="handleWordSubmit"
-                @cancel="cancelInlineInsert"
-              />
-              
-              <!-- Regular word -->
-<!-- Regular word -->
-  <!-- Update the word span to show deletion cost -->
-  <span
-    class="word"
-    :class="{ 
-      'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
-      'own-word': word.author === authStore.currentUser?.id,
-      'high-cost': deleteMode && word.deletionCost && word.deletionCost >= 100,
-      'medium-cost': deleteMode && word.deletionCost && word.deletionCost >= 10 && word.deletionCost < 100
-    }"
-    @click="handleWordClick($event, word)"
-    @mouseenter="showTooltip($event, word)"
-    @mouseleave="hideTooltip"
-  >
-    {{ word.text }}
-    <span class="like-button" @click.stop="toggleLike(word)">
-      {{ word.userLiked ? '❤️' : '🤍' }}
-    </span>
-    <span v-if="deleteMode && word.deletionCost && !isAdmin && word.author !== authStore.currentUser?.id" 
-          class="delete-cost"
-          :class="{
-            'cost-high': word.deletionCost >= 100,
-            'cost-medium': word.deletionCost >= 10 && word.deletionCost < 100
-          }">
-      {{ word.deletionCost }}
-    </span>
-  </span>
-              
-              <!-- Insert indicator between words -->
-        <!-- And for the between indicator -->
-        <span 
-          v-if="!deleteMode && activeInsertPosition !== word.position + 1" 
-          class="insert-indicator insert-between"
-          @click.stop="activateInsertAt(word.position + 1)"
-          :title="`Insert after '${word.text}'`"
-        >
-          ➕
-        </span>
-            </template>
-            
-            <!-- Inline input at the end -->
+            <!-- Insert before input (at beginning) -->
             <WordInput
-              v-if="activeInsertPosition === bookStore.wordCount"
+              v-if="activeInsertMode === 'before' && activeInsertRefWord === null"
+              key="insert-beginning"
               mode="inline"
-              :insert-position="bookStore.wordCount"
               :is-active="true"
               :auto-focus="true"
               @submit="handleWordSubmit"
-              @cancel="cancelInlineInsert"
+              @cancel="cancelInsertMode"
             />
+            
+            <template v-for="word in bookStore.words" :key="word._id">
+              <!-- Insert before this word input -->
+              <WordInput
+                v-if="activeInsertMode === 'before' && activeInsertRefWord?._id === word._id"
+                :key="`before-${word._id}`"
+                mode="inline"
+                :is-active="true"
+                :auto-focus="true"
+                @submit="handleWordSubmit"
+                @cancel="cancelInsertMode"
+              />
+              
+              <!-- Regular word -->
+              <span
+                class="word"
+                :class="{ 
+                  'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
+                  'own-word': word.author === authStore.currentUser?.id,
+                  'high-cost': deleteMode && word.deletionCost && word.deletionCost >= 100,
+                  'medium-cost': deleteMode && word.deletionCost && word.deletionCost >= 10 && word.deletionCost < 100,
+                  'deleting': pendingDeletion === word._id
+                }"
+                @click="handleWordClick($event, word)"
+                @mouseenter="showTooltip($event, word)"
+                @mouseleave="hideTooltip"
+              >
+                {{ word.text }}
+                <span class="like-button" @click.stop="toggleLike(word)">
+                  {{ word.userLiked ? '❤️' : '🤍' }}
+                </span>
+                <span v-if="deleteMode && word.deletionCost && !isAdmin && word.author !== authStore.currentUser?.id" 
+                      class="delete-cost"
+                      :class="{
+                        'cost-high': word.deletionCost >= 100,
+                        'cost-medium': word.deletionCost >= 10 && word.deletionCost < 100
+                      }">
+                  {{ word.deletionCost }}
+                </span>
+              </span>
+              
+              <!-- Insert after this word indicator - only show when not in insert mode for this position -->
+              <span 
+                v-if="!deleteMode && !(activeInsertMode === 'after' && activeInsertRefWord?._id === word._id)" 
+                class="insert-indicator insert-between"
+                @click.stop="activateInsertAfter(word)"
+                :title="`Insert after '${word.text}'`"
+              >
+                ➕
+              </span>
+              
+              <!-- Insert after this word input -->
+              <WordInput
+                v-if="activeInsertMode === 'after' && activeInsertRefWord?._id === word._id"
+                :key="`after-${word._id}`"
+                mode="inline"
+                :is-active="true"
+                :auto-focus="true"
+                @submit="handleWordSubmit"
+                @cancel="cancelInsertMode"
+              />
+            </template>
             
             <!-- Insert at end indicator -->
             <span 
-              v-if="!deleteMode && activeInsertPosition !== bookStore.wordCount" 
+              v-if="!deleteMode && !(activeInsertMode === 'after' && activeInsertRefWord === null)" 
               class="insert-indicator insert-end"
-              @click.stop="activateInsertAt(bookStore.wordCount)"
+              @click.stop="activateInsertAfter(null)"
               title="Insert at end"
             >
               Insert here ➡️
             </span>
             
-            <!-- Fallback input component -->
+            <!-- Insert at end input -->
             <WordInput
-              v-if="activeInsertPosition === null"
-              ref="fallbackInput"
-              mode="fallback"
+              v-if="activeInsertMode === 'after' && activeInsertRefWord === null"
+              key="insert-end"
+              mode="inline"
               :is-active="true"
               :auto-focus="true"
               @submit="handleWordSubmit"
-              @cancel="handleFallbackCancel"
+              @cancel="cancelInsertMode"
             />
           </div>
         </div>
@@ -1763,7 +2179,7 @@ FILE: frontend/src/views/Book.vue
       </div>
     </div>
 
-    <!-- Confirmation Modal -->
+    <!-- Rest of your modals and messages... -->
     <div v-if="showConfirmModal" class="modal-overlay" @click.self="closeModal">
       <div class="modal-content">
         <h3>⚠️ Delete All Words</h3>
@@ -1778,6 +2194,10 @@ FILE: frontend/src/views/Book.vue
 
     <div v-if="message" class="message" :class="messageType">
       {{ message }}
+    </div>
+    
+    <div v-if="deletionLock || bookStore.isDeleting" class="delete-overlay">
+      <div class="delete-spinner">🗑️ Deleting...</div>
     </div>
   </div>
 </template>
@@ -1796,13 +2216,17 @@ const authStore = useAuthStore()
 const bookStore = useBookStore()
 
 const deleteMode = ref(false)
-const activeInsertPosition = ref(null)
-const fallbackInput = ref(null)
+const activeInsertMode = ref(null) // 'before', 'after', or null
+const activeInsertRefWord = ref(null) // The word to insert before/after (null means beginning or end)
 const message = ref('')
 const messageType = ref('info')
 const showConfirmModal = ref(false)
 const activeUsers = ref(1)
 const saving = ref(false)
+const pendingDeletion = ref(null)
+const deletionLock = ref(false)
+const isAddingWord = ref(false)
+const isLikingWord = ref(false)
 let messageTimeout = null
 let isProcessingRemoteUpdate = false
 
@@ -1817,76 +2241,69 @@ const showMessage = (text, type = 'info') => {
   }, 3000)
 }
 
-const activateInsertAt = (position) => {
+const activateInsertAfter = (word) => {
   if (deleteMode.value) {
     showMessage('Please exit delete mode first', 'error')
     return
   }
   
-  // Prevent if already active at same position
-  if (activeInsertPosition.value === position) {
-    console.log('Already active at this position')
+  activeInsertMode.value = 'after'
+  activeInsertRefWord.value = word
+  showMessage(word ? `Insert mode active after "${word.text}"` : 'Insert mode active at end', 'info')
+}
+
+const activateInsertBefore = (word) => {
+  if (deleteMode.value) {
+    showMessage('Please exit delete mode first', 'error')
     return
   }
   
-  activeInsertPosition.value = position
-  showMessage(`Insert mode active at position ${position}. Type your word.`, 'info')
-}
-
-const cancelInlineInsert = () => {
-  activeInsertPosition.value = null
-  showMessage('Insert mode cancelled', 'info')
+  activeInsertMode.value = 'before'
+  activeInsertRefWord.value = word
+  showMessage(word ? `Insert mode active before "${word.text}"` : 'Insert mode active at beginning', 'info')
 }
 
 const cancelInsertMode = () => {
-  cancelInlineInsert()
+  activeInsertMode.value = null
+  activeInsertRefWord.value = null
+  showMessage('Insert mode cancelled', 'info')
 }
 
-const handleWordSubmit = async ({ text, position }) => {
+const handleWordSubmit = async ({ text }) => {
+  if (isAddingWord.value || bookStore.isAdding) {
+    showMessage('Please wait, already adding a word...', 'warning')
+    return
+  }
+  
+  isAddingWord.value = true
   saving.value = true
   
-  const result = await bookStore.addWord(text, position)
+  const options = {}
+  if (activeInsertMode.value === 'after') {
+    options.insertAfterWordId = activeInsertRefWord.value?._id || null
+  } else if (activeInsertMode.value === 'before') {
+    options.insertBeforeWordId = activeInsertRefWord.value?._id || null
+  }
+  
+  const result = await bookStore.addWord(text, options)
   
   saving.value = false
+  isAddingWord.value = false
   
   if (result.success) {
     await authStore.fetchUserStats()
-    
-    if (position !== null) {
-      // After inserting at position, move to the next position
-      // This keeps the input at the location where you just inserted
-      const nextPosition = position + 1
-      
-      // If there's a word after this position, we need to adjust
-      // because the words array has shifted
-      if (nextPosition <= bookStore.wordCount) {
-        // Keep the insert mode active at the next position
-        activeInsertPosition.value = nextPosition
-        showMessage(`Added "${text}"! Keep typing...`, 'success')
-      } else {
-        // If we're at the end, you could either:
-        // Option 1: Keep at the end (still in insert mode)
-        activeInsertPosition.value = nextPosition
-        showMessage(`Added "${text}"! Keep typing at the end...`, 'success')
-        
-        // Option 2: Or cancel insert mode (uncomment if preferred)
-        // activeInsertPosition.value = null
-        // showMessage(`Added "${text}" at position ${position}!`, 'success')
-      }
-    } else {
-      // Fallback append - keep the fallback input active
-      showMessage(`Added "${text}"! Keep typing...`, 'success')
-    }
+    cancelInsertMode()
+    showMessage(`Added "${text}"!`, 'success')
   } else {
     showMessage(result.message, 'error')
   }
 }
 
-const handleFallbackCancel = () => {
-  console.log('Fallback input cancelled')
-}
-
 const cancelDeleteMode = () => {
+  if (deletionLock.value || bookStore.isDeleting) {
+    showMessage('Cannot exit delete mode while deletion is in progress', 'warning')
+    return
+  }
   deleteMode.value = false
   showMessage('Delete mode deactivated', 'info')
 }
@@ -1920,9 +2337,13 @@ const deleteAllWords = async () => {
   }
 }
 
-// Update handleWordClick to show cost in confirmation
 const handleWordClick = async (event, word) => {
-  if (!deleteMode.value) return
+  if (!deleteMode.value || deletionLock.value || bookStore.isDeleting) {
+    if (bookStore.isDeleting) {
+      showMessage('Please wait, another word is being deleted...', 'warning')
+    }
+    return
+  }
   
   event.preventDefault()
   event.stopPropagation()
@@ -1932,12 +2353,17 @@ const handleWordClick = async (event, word) => {
     return
   }
   
-  // Get cost if not already fetched
-  let cost = word.deletionCost;
+  const currentWord = bookStore.words.find(w => w._id === word._id)
+  if (!currentWord) {
+    showMessage('This word has already been deleted', 'warning')
+    return
+  }
+  
+  let cost = word.deletionCost
   if (!cost && !isAdmin.value) {
-    const costInfo = await bookStore.getDeletionCost(word._id);
-    cost = costInfo.cost;
-    word.deletionCost = cost;
+    const costInfo = await bookStore.getDeletionCost(word._id)
+    cost = costInfo.cost
+    word.deletionCost = cost
   }
   
   if (!isAdmin.value && authStore.deleteCredits < cost) {
@@ -1945,64 +2371,83 @@ const handleWordClick = async (event, word) => {
     return
   }
   
-  const costMessage = !isAdmin.value ? ` This will cost ${cost} credit(s).` : '';
+  const costMessage = !isAdmin.value ? ` This will cost ${cost} credit(s).` : ''
+  
+  if (pendingDeletion.value) {
+    showMessage('Already processing a deletion request', 'warning')
+    return
+  }
+  
   if (confirm(`Delete "${word.text}"?${costMessage}`)) {
+    deletionLock.value = true
+    pendingDeletion.value = word._id
     saving.value = true
     
-    const result = await bookStore.deleteWord(word.position)
-    
-    saving.value = false
-    
-    if (result.success) {
-      showMessage(`"${word.text}" deleted! Cost: ${cost} credit(s)`, 'success')
-      if (!isAdmin.value) {
-        await authStore.fetchUserStats()
-        if (authStore.deleteCredits === 0) {
-          deleteMode.value = false
+    try {
+      const result = await bookStore.deleteWordById(word._id)
+      
+      if (result.success) {
+        showMessage(`"${word.text}" deleted! Cost: ${result.cost || cost} credit(s)`, 'success')
+        
+        if (!isAdmin.value) {
+          await authStore.fetchUserStats()
+          if (authStore.deleteCredits === 0) {
+            deleteMode.value = false
+            showMessage('Delete mode deactivated - no credits left', 'info')
+          }
+        }
+        
+        await updateDeletionCosts()
+      } else {
+        if (result.alreadyDeleted) {
+          showMessage('This word has already been deleted', 'warning')
+          await bookStore.fetchWords()
+        } else {
+          showMessage(result.message, 'error')
         }
       }
-      // Refresh deletion costs for remaining words
-      await updateDeletionCosts()
-    } else {
-      showMessage(result.message, 'error')
+    } catch (error) {
+      console.error('Delete error:', error)
+      showMessage('An unexpected error occurred during deletion', 'error')
+    } finally {
+      deletionLock.value = false
+      pendingDeletion.value = null
+      saving.value = false
     }
   }
 }
 
-// Update the fetchWords logic to include deletion costs when in delete mode
 const updateDeletionCosts = async () => {
   if (deleteMode.value && !isAdmin.value) {
     for (const word of bookStore.words) {
       if (word.author !== authStore.currentUser?.id) {
-        const costInfo = await bookStore.getDeletionCost(word._id);
-        word.deletionCost = costInfo.cost;
-        word.deviations = costInfo.deviations;
+        const costInfo = await bookStore.getDeletionCost(word._id)
+        word.deletionCost = costInfo.cost
+        word.deviations = costInfo.deviations
       } else {
-        word.deletionCost = 0; // Can't delete own words
+        word.deletionCost = 0
       }
     }
   }
-};
+}
 
-// Update showTooltip to include deletion cost info
 const showTooltip = async (event, word) => {
   let tooltipContent = `
     ✍️ Written by: ${word.authorName}<br>
     ❤️ Likes: ${word.likes || 0}
-  `;
+  `
   
-  // Add deletion cost info if in delete mode and not admin
   if (deleteMode.value && !isAdmin.value && word.author !== authStore.currentUser?.id) {
-    let costInfo = word.deletionCost;
+    let costInfo = word.deletionCost
     if (!costInfo) {
-      costInfo = await bookStore.getDeletionCost(word._id);
-      word.deletionCost = costInfo.cost;
-      word.deviations = costInfo.deviations;
+      costInfo = await bookStore.getDeletionCost(word._id)
+      word.deletionCost = costInfo.cost
+      word.deviations = costInfo.deviations
     }
 
-    tooltipContent += `<br>💸 Deletion cost: ${costInfo} credit(s)`;
+    tooltipContent += `<br>💸 Deletion cost: ${costInfo} credit(s)`
     if (costInfo.deviations >= 1) {
-      tooltipContent += `<br>📊 ${costInfo.deviations.toFixed(1)} std dev above average`;
+      tooltipContent += `<br>📊 ${costInfo.deviations.toFixed(1)} std dev above average`
     }
   }
   
@@ -2024,8 +2469,12 @@ const showTooltip = async (event, word) => {
   event.target._tooltip = tooltip
 }
 
-// Update enableDeleteMode to fetch costs
 const enableDeleteMode = () => {
+  if (deletionLock.value || bookStore.isDeleting) {
+    showMessage('Please wait for current operation to complete', 'warning')
+    return
+  }
+  
   if (isAdmin.value || authStore.deleteCredits > 0) {
     deleteMode.value = true
     updateDeletionCosts()
@@ -2047,6 +2496,12 @@ const toggleLike = async (word) => {
     return
   }
   
+  if (isLikingWord.value || bookStore.isLiking) {
+    showMessage('Please wait, finishing previous operation...', 'warning')
+    return
+  }
+  
+  isLikingWord.value = true
   saving.value = true
   
   let result
@@ -2063,6 +2518,7 @@ const toggleLike = async (word) => {
   }
   
   saving.value = false
+  isLikingWord.value = false
   
   if (!result.success) {
     showMessage(result.message, 'error')
@@ -2072,6 +2528,12 @@ const toggleLike = async (word) => {
 const logout = () => {
   authStore.logout()
   router.push('/')
+}
+
+const handleKeydown = (event) => {
+  if (event.key === 'Escape' && deleteMode.value) {
+    cancelDeleteMode()
+  }
 }
 
 // Socket.io handlers
@@ -2094,21 +2556,27 @@ socket.on('word-deleted', async () => {
 onMounted(async () => {
   await bookStore.fetchWords()
   await authStore.fetchUserStats()
+  document.addEventListener('keydown', handleKeydown)
 })
 
 onUnmounted(() => {
   if (messageTimeout) clearTimeout(messageTimeout)
-  // Clean up socket listeners
+  document.removeEventListener('keydown', handleKeydown)
   socket.off('word-update')
   socket.off('word-deleted')
 })
 
-// Watch deleteMode to refresh costs when entering delete mode
 watch(deleteMode, (newVal) => {
-  if (newVal && !isAdmin.value) {
+  if (newVal && !isAdmin.value && !deletionLock.value) {
     updateDeletionCosts()
   }
 })
+
+watch(() => bookStore.words, () => {
+  if (deleteMode.value && !isAdmin.value && !deletionLock.value) {
+    updateDeletionCosts()
+  }
+}, { deep: true })
 </script>
 
 
@@ -2333,6 +2801,6 @@ const handleRegister = async () => {
 STRIPPING STATISTICS
 ================================================================================
 Files with stripped styles: 7
-Total bytes stripped: 15,270
-Total stripped: 14.91 KB
+Total bytes stripped: 16,230
+Total stripped: 15.85 KB
 ================================================================================

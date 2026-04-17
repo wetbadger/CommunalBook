@@ -1,10 +1,25 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import User from '../models/User.js';
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+// Load .env if not already loaded
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.join(__dirname, '../.env') });
 
 const router = express.Router();
 
-// Fix: Add 'next' as a parameter for proper error handling
+// Check if JWT_SECRET is set
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+  console.error('❌ JWT_SECRET is not defined in environment variables');
+  process.exit(1);
+}
+
 router.post('/register', async (req, res, next) => {
   try {
     const { username, password } = req.body;
@@ -19,7 +34,7 @@ router.post('/register', async (req, res, next) => {
     
     const token = jwt.sign(
       { userId: user._id, username: user.username },
-      process.env.JWT_SECRET || 'your-secret-key',
+      JWT_SECRET,  // Use the validated secret
       { expiresIn: '7d' }
     );
     
@@ -33,7 +48,6 @@ router.post('/register', async (req, res, next) => {
       } 
     });
   } catch (error) {
-    // Pass error to Express error handler
     next(error);
   }
 });
@@ -54,7 +68,7 @@ router.post('/login', async (req, res, next) => {
     
     const token = jwt.sign(
       { userId: user._id, username: user.username },
-      process.env.JWT_SECRET || 'your-secret-key',
+      JWT_SECRET,  // Use the validated secret
       { expiresIn: '7d' }
     );
     

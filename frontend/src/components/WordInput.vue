@@ -51,7 +51,7 @@ const placeholder = computed(() => {
   if (props.mode === 'inline' && props.insertPosition !== null) {
     return `Insert at position ${props.insertPosition}...`
   }
-  return 'Type a word...'
+  return ''
 })
 
 // Handle click outside
@@ -233,6 +233,7 @@ defineExpose({
 
 .fallback-mode {
   background: #fef5e7 !important;
+  display: none;
 }
 
 .inline-mode.active {

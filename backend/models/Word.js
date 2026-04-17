@@ -16,11 +16,7 @@ const wordSchema = new mongoose.Schema({
     ref: 'Word',
     default: null
   },
-  // For quick ordering without traversing entire list
-  order: {
-    type: Number,
-    index: true  // For sorting when needed
-  },
+  // REMOVED: order field - no longer needed
   author: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
@@ -43,8 +39,5 @@ const wordSchema = new mongoose.Schema({
     default: Date.now
   }
 });
-
-// Add index for faster queries
-wordSchema.index({ order: 1 });
 
 export default mongoose.model('Word', wordSchema);

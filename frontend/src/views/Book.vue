@@ -1,5 +1,5 @@
 <template>
-  <div class="book-container">
+  <div class="book-container" :class="{ 'deleting-active': deletionLock || bookStore.isDeleting }">
     <header class="header">
       <div class="header-left">
         <h1>📖 Collaborative Book</h1>
@@ -27,7 +27,6 @@
           Cancel Delete Mode
         </button>
         
-        <!-- Admin Delete All Words Button -->
         <button 
           v-if="isAdmin" 
           @click="confirmDeleteAllWords" 
@@ -37,18 +36,28 @@
           ⚠️ Delete All Words
         </button>
         
-        <button v-if="activeInsertPosition !== null" @click="cancelInsertMode" class="cancel-btn">
+        <button v-if="activeInsertMode" @click="cancelInsertMode" class="cancel-btn">
           Cancel Insert Mode
         </button>
         
         <div class="info" v-if="deleteMode">
-          Click on any word (not yours) to delete it (costs 1 credit)
+          Click on any word (not yours) to delete it
         </div>
-        <div class="insert-info" v-if="activeInsertPosition !== null">
-          📍 Inserting at position {{ activeInsertPosition }}. Type your word and press Enter/Space
+        <div class="insert-info" v-if="activeInsertMode && activeInsertRefWord">
+          📍 Inserting {{ activeInsertMode === 'after' ? 'after' : 'before' }} "{{ activeInsertRefWord.text }}". Type your word and press Enter/Space
+        </div>
+        <div class="insert-info" v-if="activeInsertMode && !activeInsertRefWord">
+          📍 Inserting at {{ activeInsertMode === 'after' ? 'end' : 'beginning' }}. Type your word and press Enter/Space
         </div>
         <div class="admin-info" v-if="isAdmin">
           🔧 Admin Mode: Unlimited delete credits
+        </div>
+        
+        <div v-if="bookStore.isAdding || isAddingWord" class="status-indicator">
+          Adding word...
+        </div>
+        <div v-if="bookStore.isLiking || isLikingWord" class="status-indicator">
+          Processing like...
         </div>
       </div>
 
@@ -66,99 +75,98 @@
           ref="editorRef"
         >
           <div class="words-wrapper">
-            <!-- Insert at beginning -->
+            <!-- Insert at beginning indicator - only show when not in insert mode -->
             <span 
-              v-if="!deleteMode && activeInsertPosition !== 0" 
+              v-if="!deleteMode && !(activeInsertMode === 'before' && activeInsertRefWord === null)" 
               class="insert-indicator insert-beginning"
-              @click.stop="activateInsertAt(0)"
+              @click.stop="activateInsertBefore(null)"
               title="Insert at beginning"
             >
               ⬅️ Insert here
             </span>
             
-            <template v-for="word in bookStore.words" :key="word.id">
-              <!-- Inline input component at specific position -->
+            <!-- Insert before input (at beginning) -->
+            <WordInput
+              v-if="activeInsertMode === 'before' && activeInsertRefWord === null"
+              key="insert-beginning"
+              mode="inline"
+              :is-active="true"
+              :auto-focus="true"
+              @submit="handleWordSubmit"
+              @cancel="cancelInsertMode"
+            />
+            
+            <template v-for="word in bookStore.words" :key="word._id">
+              <!-- Insert before this word input -->
               <WordInput
-                v-if="activeInsertPosition === word.position"
+                v-if="activeInsertMode === 'before' && activeInsertRefWord?._id === word._id"
+                :key="`before-${word._id}`"
                 mode="inline"
-                :insert-position="word.position"
                 :is-active="true"
                 :auto-focus="true"
                 @submit="handleWordSubmit"
-                @cancel="cancelInlineInsert"
+                @cancel="cancelInsertMode"
               />
               
               <!-- Regular word -->
-<!-- Regular word -->
-  <!-- Update the word span to show deletion cost -->
-  <span
-    class="word"
-    :class="{ 
-      'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
-      'own-word': word.author === authStore.currentUser?.id,
-      'high-cost': deleteMode && word.deletionCost && word.deletionCost >= 100,
-      'medium-cost': deleteMode && word.deletionCost && word.deletionCost >= 10 && word.deletionCost < 100
-    }"
-    @click="handleWordClick($event, word)"
-    @mouseenter="showTooltip($event, word)"
-    @mouseleave="hideTooltip"
-  >
-    {{ word.text }}
-    <span class="like-button" @click.stop="toggleLike(word)">
-      {{ word.userLiked ? '❤️' : '🤍' }}
-    </span>
-    <span v-if="deleteMode && word.deletionCost && !isAdmin && word.author !== authStore.currentUser?.id" 
-          class="delete-cost"
-          :class="{
-            'cost-high': word.deletionCost >= 100,
-            'cost-medium': word.deletionCost >= 10 && word.deletionCost < 100
-          }">
-      {{ word.deletionCost }}
-    </span>
-  </span>
+              <span
+                class="word"
+                :class="{ 
+                  'deletable': deleteMode && (isAdmin || word.author !== authStore.currentUser?.id),
+                  'own-word': word.author === authStore.currentUser?.id,
+                  'high-cost': deleteMode && word.deletionCost && word.deletionCost >= 100,
+                  'medium-cost': deleteMode && word.deletionCost && word.deletionCost >= 10 && word.deletionCost < 100,
+                  'deleting': pendingDeletion === word._id
+                }"
+                @click="handleWordClick($event, word)"
+                @mouseenter="showTooltip($event, word)"
+                @mouseleave="hideTooltip"
+              >
+                {{ word.text }}
+                <span class="like-button" @click.stop="toggleLike(word)">
+                  {{ word.userLiked ? '❤️' : '🤍' }}
+                </span>
+                <span v-if="deleteMode && word.deletionCost && !isAdmin && word.author !== authStore.currentUser?.id" 
+                      class="delete-cost"
+                      :class="{
+                        'cost-high': word.deletionCost >= 100,
+                        'cost-medium': word.deletionCost >= 10 && word.deletionCost < 100
+                      }">
+                  {{ word.deletionCost }}
+                </span>
+              </span>
               
-              <!-- Insert indicator between words -->
-        <!-- And for the between indicator -->
-        <span 
-          v-if="!deleteMode && activeInsertPosition !== word.position + 1" 
-          class="insert-indicator insert-between"
-          @click.stop="activateInsertAt(word.position + 1)"
-          :title="`Insert after '${word.text}'`"
-        >
-          ➕
-        </span>
+              <!-- Insert after this word indicator - only show when not in insert mode for this position -->
+              <span 
+                v-if="!deleteMode && !(activeInsertMode === 'after' && activeInsertRefWord?._id === word._id)" 
+                class="insert-indicator insert-between"
+                @click.stop="activateInsertAfter(word)"
+                :title="`Insert after '${word.text}'`"
+              >
+                ➕
+              </span>
+              
+              <!-- Insert after this word input -->
+              <WordInput
+                v-if="activeInsertMode === 'after' && activeInsertRefWord?._id === word._id"
+                :key="`after-${word._id}`"
+                mode="inline"
+                :is-active="true"
+                :auto-focus="true"
+                @submit="handleWordSubmit"
+                @cancel="cancelInsertMode"
+              />
             </template>
             
-            <!-- Inline input at the end -->
+            <!-- Insert at end input -->
             <WordInput
-              v-if="activeInsertPosition === bookStore.wordCount"
+              v-if="activeInsertMode === 'after' && activeInsertRefWord === null"
+              key="insert-end"
               mode="inline"
-              :insert-position="bookStore.wordCount"
               :is-active="true"
               :auto-focus="true"
               @submit="handleWordSubmit"
-              @cancel="cancelInlineInsert"
-            />
-            
-            <!-- Insert at end indicator -->
-            <span 
-              v-if="!deleteMode && activeInsertPosition !== bookStore.wordCount" 
-              class="insert-indicator insert-end"
-              @click.stop="activateInsertAt(bookStore.wordCount)"
-              title="Insert at end"
-            >
-              Insert here ➡️
-            </span>
-            
-            <!-- Fallback input component -->
-            <WordInput
-              v-if="activeInsertPosition === null"
-              ref="fallbackInput"
-              mode="fallback"
-              :is-active="true"
-              :auto-focus="true"
-              @submit="handleWordSubmit"
-              @cancel="handleFallbackCancel"
+              @cancel="cancelInsertMode"
             />
           </div>
         </div>
@@ -176,7 +184,7 @@
       </div>
     </div>
 
-    <!-- Confirmation Modal -->
+    <!-- Rest of your modals and messages... -->
     <div v-if="showConfirmModal" class="modal-overlay" @click.self="closeModal">
       <div class="modal-content">
         <h3>⚠️ Delete All Words</h3>
@@ -191,6 +199,10 @@
 
     <div v-if="message" class="message" :class="messageType">
       {{ message }}
+    </div>
+    
+    <div v-if="deletionLock || bookStore.isDeleting" class="delete-overlay">
+      <div class="delete-spinner">🗑️ Deleting...</div>
     </div>
   </div>
 </template>
@@ -209,13 +221,17 @@ const authStore = useAuthStore()
 const bookStore = useBookStore()
 
 const deleteMode = ref(false)
-const activeInsertPosition = ref(null)
-const fallbackInput = ref(null)
+const activeInsertMode = ref(null) // 'before', 'after', or null
+const activeInsertRefWord = ref(null) // The word to insert before/after (null means beginning or end)
 const message = ref('')
 const messageType = ref('info')
 const showConfirmModal = ref(false)
 const activeUsers = ref(1)
 const saving = ref(false)
+const pendingDeletion = ref(null)
+const deletionLock = ref(false)
+const isAddingWord = ref(false)
+const isLikingWord = ref(false)
 let messageTimeout = null
 let isProcessingRemoteUpdate = false
 
@@ -230,76 +246,107 @@ const showMessage = (text, type = 'info') => {
   }, 3000)
 }
 
-const activateInsertAt = (position) => {
+const activateInsertAfter = (word) => {
   if (deleteMode.value) {
     showMessage('Please exit delete mode first', 'error')
     return
   }
   
-  // Prevent if already active at same position
-  if (activeInsertPosition.value === position) {
-    console.log('Already active at this position')
+  activeInsertMode.value = 'after'
+  activeInsertRefWord.value = word
+  showMessage(word ? `Insert mode active after "${word.text}"` : 'Insert mode active at end', 'info')
+}
+
+const activateInsertBefore = (word) => {
+  if (deleteMode.value) {
+    showMessage('Please exit delete mode first', 'error')
     return
   }
   
-  activeInsertPosition.value = position
-  showMessage(`Insert mode active at position ${position}. Type your word.`, 'info')
-}
-
-const cancelInlineInsert = () => {
-  activeInsertPosition.value = null
-  showMessage('Insert mode cancelled', 'info')
+  activeInsertMode.value = 'before'
+  activeInsertRefWord.value = word
+  showMessage(word ? `Insert mode active before "${word.text}"` : 'Insert mode active at beginning', 'info')
 }
 
 const cancelInsertMode = () => {
-  cancelInlineInsert()
+  activeInsertMode.value = null
+  activeInsertRefWord.value = null
+  showMessage('Insert mode cancelled', 'info')
 }
 
-const handleWordSubmit = async ({ text, position }) => {
+// Store the word we're inserting after/before
+const lastInsertedAfterWord = ref(null)
+
+const handleWordSubmit = async ({ text }) => {
+  if (isAddingWord.value || bookStore.isAdding) {
+    showMessage('Please wait, already adding a word...', 'warning')
+    return
+  }
+  
+  isAddingWord.value = true
   saving.value = true
   
-  const result = await bookStore.addWord(text, position)
+  // Store current insert position before clearing
+  const insertAfterThis = activeInsertRefWord.value
+  const currentMode = activeInsertMode.value
+  
+  const options = {}
+  if (currentMode === 'after') {
+    options.insertAfterWordId = insertAfterThis?._id || null
+  } else if (currentMode === 'before') {
+    options.insertBeforeWordId = insertAfterThis?._id || null
+  }
+  
+  const result = await bookStore.addWord(text, options)
   
   saving.value = false
+  isAddingWord.value = false
   
   if (result.success) {
     await authStore.fetchUserStats()
     
-    if (position !== null) {
-      // After inserting at position, move to the next position
-      // This keeps the input at the location where you just inserted
-      const nextPosition = position + 1
+    // Instead of canceling, automatically set up the next insert position
+    if (currentMode === 'after') {
+      // For after mode, we want to insert after the word we just added
+      // Wait a moment for the words array to update
+      await nextTick()
       
-      // If there's a word after this position, we need to adjust
-      // because the words array has shifted
-      if (nextPosition <= bookStore.wordCount) {
-        // Keep the insert mode active at the next position
-        activeInsertPosition.value = nextPosition
-        showMessage(`Added "${text}"! Keep typing...`, 'success')
-      } else {
-        // If we're at the end, you could either:
-        // Option 1: Keep at the end (still in insert mode)
-        activeInsertPosition.value = nextPosition
-        showMessage(`Added "${text}"! Keep typing at the end...`, 'success')
-        
-        // Option 2: Or cancel insert mode (uncomment if preferred)
-        // activeInsertPosition.value = null
-        // showMessage(`Added "${text}" at position ${position}!`, 'success')
+      // Find the word we just added (it should be the one with matching text and recent timestamp)
+      // Or more simply, if we were inserting after a specific word, the new word is after that
+      if (insertAfterThis) {
+        // Find the index of the reference word
+        const refIndex = bookStore.words.findIndex(w => w._id === insertAfterThis._id)
+        if (refIndex !== -1 && refIndex + 1 < bookStore.words.length) {
+          // Activate insert after the newly added word
+          activateInsertAfter(bookStore.words[refIndex + 1])
+          showMessage(`Added "${text}"! Keep typing...`, 'success')
+          return
+        }
+      } else if (insertAfterThis === null) {
+        // We were inserting at the end, so the new word is at the end
+        const lastWord = bookStore.words[bookStore.words.length - 1]
+        if (lastWord) {
+          activateInsertAfter(lastWord)
+          showMessage(`Added "${text}"! Keep typing...`, 'success')
+          return
+        }
       }
-    } else {
-      // Fallback append - keep the fallback input active
-      showMessage(`Added "${text}"! Keep typing...`, 'success')
     }
+    
+    // If we couldn't auto-reactivate, just cancel mode
+    cancelInsertMode()
+    showMessage(`Added "${text}"!`, 'success')
   } else {
     showMessage(result.message, 'error')
+    cancelInsertMode()
   }
 }
 
-const handleFallbackCancel = () => {
-  console.log('Fallback input cancelled')
-}
-
 const cancelDeleteMode = () => {
+  if (deletionLock.value || bookStore.isDeleting) {
+    showMessage('Cannot exit delete mode while deletion is in progress', 'warning')
+    return
+  }
   deleteMode.value = false
   showMessage('Delete mode deactivated', 'info')
 }
@@ -333,9 +380,13 @@ const deleteAllWords = async () => {
   }
 }
 
-// Update handleWordClick to show cost in confirmation
 const handleWordClick = async (event, word) => {
-  if (!deleteMode.value) return
+  if (!deleteMode.value || deletionLock.value || bookStore.isDeleting) {
+    if (bookStore.isDeleting) {
+      showMessage('Please wait, another word is being deleted...', 'warning')
+    }
+    return
+  }
   
   event.preventDefault()
   event.stopPropagation()
@@ -345,12 +396,17 @@ const handleWordClick = async (event, word) => {
     return
   }
   
-  // Get cost if not already fetched
-  let cost = word.deletionCost;
+  const currentWord = bookStore.words.find(w => w._id === word._id)
+  if (!currentWord) {
+    showMessage('This word has already been deleted', 'warning')
+    return
+  }
+  
+  let cost = word.deletionCost
   if (!cost && !isAdmin.value) {
-    const costInfo = await bookStore.getDeletionCost(word._id);
-    cost = costInfo.cost;
-    word.deletionCost = cost;
+    const costInfo = await bookStore.getDeletionCost(word._id)
+    cost = costInfo.cost
+    word.deletionCost = cost
   }
   
   if (!isAdmin.value && authStore.deleteCredits < cost) {
@@ -358,64 +414,83 @@ const handleWordClick = async (event, word) => {
     return
   }
   
-  const costMessage = !isAdmin.value ? ` This will cost ${cost} credit(s).` : '';
+  const costMessage = !isAdmin.value ? ` This will cost ${cost} credit(s).` : ''
+  
+  if (pendingDeletion.value) {
+    showMessage('Already processing a deletion request', 'warning')
+    return
+  }
+  
   if (confirm(`Delete "${word.text}"?${costMessage}`)) {
+    deletionLock.value = true
+    pendingDeletion.value = word._id
     saving.value = true
     
-    const result = await bookStore.deleteWord(word.position)
-    
-    saving.value = false
-    
-    if (result.success) {
-      showMessage(`"${word.text}" deleted! Cost: ${cost} credit(s)`, 'success')
-      if (!isAdmin.value) {
-        await authStore.fetchUserStats()
-        if (authStore.deleteCredits === 0) {
-          deleteMode.value = false
+    try {
+      const result = await bookStore.deleteWordById(word._id)
+      
+      if (result.success) {
+        showMessage(`"${word.text}" deleted! Cost: ${result.cost || cost} credit(s)`, 'success')
+        
+        if (!isAdmin.value) {
+          await authStore.fetchUserStats()
+          if (authStore.deleteCredits === 0) {
+            deleteMode.value = false
+            showMessage('Delete mode deactivated - no credits left', 'info')
+          }
+        }
+        
+        await updateDeletionCosts()
+      } else {
+        if (result.alreadyDeleted) {
+          showMessage('This word has already been deleted', 'warning')
+          await bookStore.fetchWords()
+        } else {
+          showMessage(result.message, 'error')
         }
       }
-      // Refresh deletion costs for remaining words
-      await updateDeletionCosts()
-    } else {
-      showMessage(result.message, 'error')
+    } catch (error) {
+      console.error('Delete error:', error)
+      showMessage('An unexpected error occurred during deletion', 'error')
+    } finally {
+      deletionLock.value = false
+      pendingDeletion.value = null
+      saving.value = false
     }
   }
 }
 
-// Update the fetchWords logic to include deletion costs when in delete mode
 const updateDeletionCosts = async () => {
   if (deleteMode.value && !isAdmin.value) {
     for (const word of bookStore.words) {
       if (word.author !== authStore.currentUser?.id) {
-        const costInfo = await bookStore.getDeletionCost(word._id);
-        word.deletionCost = costInfo.cost;
-        word.deviations = costInfo.deviations;
+        const costInfo = await bookStore.getDeletionCost(word._id)
+        word.deletionCost = costInfo.cost
+        word.deviations = costInfo.deviations
       } else {
-        word.deletionCost = 0; // Can't delete own words
+        word.deletionCost = 0
       }
     }
   }
-};
+}
 
-// Update showTooltip to include deletion cost info
 const showTooltip = async (event, word) => {
   let tooltipContent = `
     ✍️ Written by: ${word.authorName}<br>
     ❤️ Likes: ${word.likes || 0}
-  `;
+  `
   
-  // Add deletion cost info if in delete mode and not admin
   if (deleteMode.value && !isAdmin.value && word.author !== authStore.currentUser?.id) {
-    let costInfo = word.deletionCost;
+    let costInfo = word.deletionCost
     if (!costInfo) {
-      costInfo = await bookStore.getDeletionCost(word._id);
-      word.deletionCost = costInfo.cost;
-      word.deviations = costInfo.deviations;
+      costInfo = await bookStore.getDeletionCost(word._id)
+      word.deletionCost = costInfo.cost
+      word.deviations = costInfo.deviations
     }
 
-    tooltipContent += `<br>💸 Deletion cost: ${costInfo} credit(s)`;
+    tooltipContent += `<br>💸 Deletion cost: ${costInfo} credit(s)`
     if (costInfo.deviations >= 1) {
-      tooltipContent += `<br>📊 ${costInfo.deviations.toFixed(1)} std dev above average`;
+      tooltipContent += `<br>📊 ${costInfo.deviations.toFixed(1)} std dev above average`
     }
   }
   
@@ -437,8 +512,12 @@ const showTooltip = async (event, word) => {
   event.target._tooltip = tooltip
 }
 
-// Update enableDeleteMode to fetch costs
 const enableDeleteMode = () => {
+  if (deletionLock.value || bookStore.isDeleting) {
+    showMessage('Please wait for current operation to complete', 'warning')
+    return
+  }
+  
   if (isAdmin.value || authStore.deleteCredits > 0) {
     deleteMode.value = true
     updateDeletionCosts()
@@ -460,6 +539,12 @@ const toggleLike = async (word) => {
     return
   }
   
+  if (isLikingWord.value || bookStore.isLiking) {
+    showMessage('Please wait, finishing previous operation...', 'warning')
+    return
+  }
+  
+  isLikingWord.value = true
   saving.value = true
   
   let result
@@ -476,6 +561,7 @@ const toggleLike = async (word) => {
   }
   
   saving.value = false
+  isLikingWord.value = false
   
   if (!result.success) {
     showMessage(result.message, 'error')
@@ -485,6 +571,12 @@ const toggleLike = async (word) => {
 const logout = () => {
   authStore.logout()
   router.push('/')
+}
+
+const handleKeydown = (event) => {
+  if (event.key === 'Escape' && deleteMode.value) {
+    cancelDeleteMode()
+  }
 }
 
 // Socket.io handlers
@@ -507,21 +599,27 @@ socket.on('word-deleted', async () => {
 onMounted(async () => {
   await bookStore.fetchWords()
   await authStore.fetchUserStats()
+  document.addEventListener('keydown', handleKeydown)
 })
 
 onUnmounted(() => {
   if (messageTimeout) clearTimeout(messageTimeout)
-  // Clean up socket listeners
+  document.removeEventListener('keydown', handleKeydown)
   socket.off('word-update')
   socket.off('word-deleted')
 })
 
-// Watch deleteMode to refresh costs when entering delete mode
 watch(deleteMode, (newVal) => {
-  if (newVal && !isAdmin.value) {
+  if (newVal && !isAdmin.value && !deletionLock.value) {
     updateDeletionCosts()
   }
 })
+
+watch(() => bookStore.words, () => {
+  if (deleteMode.value && !isAdmin.value && !deletionLock.value) {
+    updateDeletionCosts()
+  }
+}, { deep: true })
 </script>
 
 <style scoped>
@@ -707,6 +805,33 @@ watch(deleteMode, (newVal) => {
   background: #edf2f7;
 }
 
+/* Add to the style section of Book.vue */
+
+.word.deleting {
+  opacity: 0.5;
+  pointer-events: none;
+  animation: pulse 0.5s ease-in-out;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 0.3; }
+}
+
+.delete-mode-active.deleting-active {
+  cursor: wait !important;
+}
+
+.deleting-active .word {
+  pointer-events: none;
+}
+
+/* Visual feedback for delete button state */
+.delete-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .input-word {
   background: #fef5e7 !important;
   min-width: 2px;
@@ -867,10 +992,6 @@ watch(deleteMode, (newVal) => {
   }
 }
 
-/* ... (keep all your existing styles) ... */
-
-/* Add these new styles */
-/* Keep all your existing styles, plus: */
 .insert-indicator {
   display: inline-flex;
   align-items: center;
@@ -994,5 +1115,32 @@ watch(deleteMode, (newVal) => {
   0% { opacity: 1; }
   50% { opacity: 0.7; }
   100% { opacity: 1; }
+}
+
+/* Add spinner animation */
+.spinner {
+  display: inline-block;
+  animation: spin 1s linear infinite;
+  margin-left: 5px;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.status-indicator {
+  display: inline-block;
+  margin-left: 10px;
+  padding: 4px 8px;
+  background-color: #f0f0f0;
+  border-radius: 4px;
+  font-size: 12px;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
 }
 </style>
