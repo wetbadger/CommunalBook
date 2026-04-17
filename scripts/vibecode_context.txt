@@ -93,11 +93,15 @@ export const idempotencyMiddleware = (req, res, next) => {
   // Check if this request has been processed before
   const existingResponse = idempotencyStore.get(idempotencyKey);
   
-  if (existingResponse) {
-    console.log(`🔄 Idempotent request detected: ${idempotencyKey}`);
-    // Return the cached response
-    return res.status(existingResponse.status).json(existingResponse.data);
+if (existingResponse) {
+  // If still processing, don't return cached response
+  if (existingResponse.status === 'processing') {
+    console.log(`⏳ Request still processing: ${idempotencyKey}`);
+    return next(); // Let it process normally
   }
+  console.log(`🔄 Idempotent request detected: ${idempotencyKey}`);
+  return res.status(existingResponse.status).json(existingResponse.data);
+}
   
   // Store that this request is being processed
   idempotencyStore.set(idempotencyKey, {
@@ -1609,9 +1613,11 @@ export const useAuthStore = defineStore('auth', {
 FILE: frontend/src/stores/book.js
 ================================================================================
 
-// frontend/src/stores/book.js
+// frontend/src/stores/book.js - Full version with all features
+
 import { defineStore } from 'pinia'
 import axios from 'axios'
+import { io } from 'socket.io-client'
 import { generateIdempotencyKey, idempotencyTracker } from '../utils/idempotency'
 
 export const useBookStore = defineStore('book', {
@@ -1621,7 +1627,10 @@ export const useBookStore = defineStore('book', {
     error: null,
     isDeleting: false,
     isAdding: false,
-    isLiking: false
+    isLiking: false,
+    socket: null,
+    needsInitialLoad: true,
+    _updateLock: false // Prevent recursive updates
   }),
   
   getters: {
@@ -1630,6 +1639,44 @@ export const useBookStore = defineStore('book', {
   },
   
   actions: {
+    // Initial load - only happens once when app starts
+    async loadInitialBook() {
+      if (!this.needsInitialLoad) return
+      
+      this.loading = true
+      try {
+        const response = await axios.get('/api/book/words')
+        this.words = response.data
+        this.needsInitialLoad = false
+        
+        // Load like statuses in background (don't block UI)
+        this.loadLikeStatusesInBackground()
+      } catch (error) {
+        this.error = 'Failed to load the book'
+        console.error(error)
+      } finally {
+        this.loading = false
+      }
+    },
+    
+    async loadLikeStatusesInBackground() {
+      const token = localStorage.getItem('token')
+      if (!token) return
+      
+      // Load in small batches to not block UI
+      const batchSize = 20
+      for (let i = 0; i < this.words.length; i += batchSize) {
+        const batch = this.words.slice(i, i + batchSize)
+        await Promise.all(
+          batch.map(async (word) => {
+            const likeStatus = await this.checkLikeStatus(word._id)
+            word.userLiked = likeStatus.liked
+            word.likes = likeStatus.likes
+          })
+        )
+      }
+    },
+    
     async getDeletionCost(wordId) {
       try {
         const response = await axios.get(`/api/book/words/${wordId}/deletion-cost`);
@@ -1640,7 +1687,7 @@ export const useBookStore = defineStore('book', {
       }
     },
     
-    // Add word with insertion options
+    // Add word with full idempotency support
     async addWord(wordText, options = {}) {
       if (this.isAdding) {
         return { success: false, message: 'Already adding a word, please wait...' };
@@ -1648,7 +1695,7 @@ export const useBookStore = defineStore('book', {
       
       this.isAdding = true;
       
-      // Generate idempotency key based on operation
+      // Generate operation key for idempotency
       const operationKey = options.insertAfterWordId || options.insertBeforeWordId || 'append';
       const idempotencyKey = generateIdempotencyKey('add-word', `${wordText}-${operationKey}`);
       
@@ -1659,6 +1706,26 @@ export const useBookStore = defineStore('book', {
       
       idempotencyTracker.addPending(idempotencyKey);
       
+      // Create optimistic word for instant UI update
+      const tempId = `temp-${Date.now()}-${Math.random()}`;
+      let insertIndex = this.calculateInsertPosition(options);
+      
+      const optimisticWord = {
+        _id: tempId,
+        text: wordText,
+        author: this.authStore?.currentUser?.id,
+        authorName: this.authStore?.currentUser?.username,
+        likes: 0,
+        likedBy: [],
+        userLiked: false,
+        createdAt: new Date(),
+        _optimistic: true,
+        _tempId: tempId
+      };
+      
+      // Insert optimistically
+      this.words.splice(insertIndex, 0, optimisticWord);
+      
       try {
         const payload = { text: wordText };
         if (options.insertAfterWordId) {
@@ -1668,18 +1735,34 @@ export const useBookStore = defineStore('book', {
         }
         
         const response = await axios.post('/api/book/words', payload, {
-          headers: {
-            'Idempotency-Key': idempotencyKey
-          }
+          headers: { 'Idempotency-Key': idempotencyKey }
         });
         
-        await this.fetchWords();
+        // Replace optimistic with real word
+        const index = this.words.findIndex(w => w._tempId === tempId);
+        if (index !== -1) {
+          this.words[index] = { ...response.data, _justAdded: true };
+          setTimeout(() => {
+            const word = this.words.find(w => w._id === response.data._id);
+            if (word) delete word._justAdded;
+          }, 300);
+        }
+        
+        // Broadcast to other users
+        if (this.socket) {
+          this.socket.emit('word-added', response.data);
+        }
         
         return { success: true, word: response.data };
       } catch (error) {
+        // Remove optimistic word on failure
+        const index = this.words.findIndex(w => w._tempId === tempId);
+        if (index !== -1) {
+          this.words.splice(index, 1);
+        }
+        
         if (error.response?.status === 409) {
-          console.log('Duplicate add request detected');
-          await this.fetchWords();
+          await this.syncIncremental();
           return { success: true, message: 'Word was already added' };
         }
         
@@ -1690,7 +1773,18 @@ export const useBookStore = defineStore('book', {
       }
     },
     
-    // Delete word by ID
+    calculateInsertPosition(options) {
+      if (options.insertAfterWordId) {
+        const afterIndex = this.words.findIndex(w => w._id === options.insertAfterWordId);
+        if (afterIndex !== -1) return afterIndex + 1;
+      } else if (options.insertBeforeWordId) {
+        const beforeIndex = this.words.findIndex(w => w._id === options.insertBeforeWordId);
+        if (beforeIndex !== -1) return beforeIndex;
+      }
+      return this.words.length; // Append to end
+    },
+    
+    // Delete word with idempotency
     async deleteWordById(wordId) {
       if (this.isDeleting) {
         return { success: false, message: 'Another deletion is in progress, please wait...' };
@@ -1707,28 +1801,44 @@ export const useBookStore = defineStore('book', {
       
       idempotencyTracker.addPending(idempotencyKey);
       
+      // Find word and mark as deleting optimistically
+      const index = this.words.findIndex(w => w._id === wordId);
+      if (index === -1) {
+        this.isDeleting = false;
+        idempotencyTracker.removePending(idempotencyKey);
+        return { success: false, message: 'Word not found' };
+      }
+      
+      const deletedWord = this.words[index];
+      this.words[index]._deleting = true;
+      
       try {
         const response = await axios.delete(`/api/book/words/${wordId}`, {
-          headers: {
-            'Idempotency-Key': idempotencyKey
-          }
+          headers: { 'Idempotency-Key': idempotencyKey }
         });
         
-        // Update local state - remove the deleted word
-        const deletedIndex = this.words.findIndex(w => w._id === wordId);
-        if (deletedIndex !== -1) {
-          this.words.splice(deletedIndex, 1);
+        // Remove from UI with animation
+        this.words.splice(index, 1);
+        
+        // Broadcast to other users
+        if (this.socket) {
+          this.socket.emit('word-deleted', { wordId });
         }
         
         return { 
           success: true, 
-          credits: response.data.remainingCredits,
+          remainingCredits: response.data.remainingCredits,
           cost: response.data.cost,
           deletedWordId: wordId
         };
       } catch (error) {
+        // Restore word on failure
+        if (this.words[index]) {
+          delete this.words[index]._deleting;
+        }
+        
         if (error.response?.status === 409) {
-          console.log('Duplicate delete request detected');
+          await this.syncIncremental();
           return { 
             success: false, 
             message: 'This word has already been deleted',
@@ -1746,7 +1856,7 @@ export const useBookStore = defineStore('book', {
       }
     },
     
-    // Like word
+    // Like word with idempotency
     async likeWord(wordId) {
       if (this.isLiking) {
         return { success: false, message: 'Please wait, finishing previous like operation...' };
@@ -1763,34 +1873,47 @@ export const useBookStore = defineStore('book', {
       
       idempotencyTracker.addPending(idempotencyKey);
       
-      try {
-        const response = await axios.post(`/api/book/words/${wordId}/like`, {}, {
-          headers: {
-            'Idempotency-Key': idempotencyKey
-          }
-        });
+      // Update optimistically
+      const word = this.words.find(w => w._id === wordId);
+      if (word) {
+        const oldLikes = word.likes;
+        word.likes += 1;
+        word.userLiked = true;
+        word._optimisticLike = true;
         
-        const word = this.words.find(w => w._id === wordId);
-        if (word) {
+        try {
+          const response = await axios.post(`/api/book/words/${wordId}/like`, {}, {
+            headers: { 'Idempotency-Key': idempotencyKey }
+          });
+          
+          // Sync final state
           word.likes = response.data.likes;
-          word.userLiked = true;
+          word.userLiked = response.data.liked;
+          delete word._optimisticLike;
+          
+          return { success: true, likes: response.data.likes };
+        } catch (error) {
+          // Rollback on error
+          word.likes = oldLikes;
+          word.userLiked = false;
+          delete word._optimisticLike;
+          
+          if (error.response?.status === 409) {
+            return { success: false, message: 'You already liked this word' };
+          }
+          
+          return { success: false, message: error.response?.data?.message || 'Failed to like word' };
+        } finally {
+          this.isLiking = false;
+          idempotencyTracker.removePending(idempotencyKey);
         }
-        
-        return { success: true, likes: response.data.likes };
-      } catch (error) {
-        if (error.response?.status === 409) {
-          console.log('Duplicate like request detected');
-          return { success: false, message: 'You already liked this word' };
-        }
-        
-        return { success: false, message: error.response?.data?.message || 'Failed to like word' };
-      } finally {
-        this.isLiking = false;
-        idempotencyTracker.removePending(idempotencyKey);
       }
+      
+      this.isLiking = false;
+      return { success: false, message: 'Word not found' };
     },
     
-    // Unlike word
+    // Unlike word with idempotency
     async unlikeWord(wordId) {
       if (this.isLiking) {
         return { success: false, message: 'Please wait, finishing previous operation...' };
@@ -1807,31 +1930,44 @@ export const useBookStore = defineStore('book', {
       
       idempotencyTracker.addPending(idempotencyKey);
       
-      try {
-        const response = await axios.delete(`/api/book/words/${wordId}/like`, {
-          headers: {
-            'Idempotency-Key': idempotencyKey
-          }
-        });
+      // Update optimistically
+      const word = this.words.find(w => w._id === wordId);
+      if (word) {
+        const oldLikes = word.likes;
+        word.likes -= 1;
+        word.userLiked = false;
+        word._optimisticLike = true;
         
-        const word = this.words.find(w => w._id === wordId);
-        if (word) {
+        try {
+          const response = await axios.delete(`/api/book/words/${wordId}/like`, {
+            headers: { 'Idempotency-Key': idempotencyKey }
+          });
+          
+          // Sync final state
           word.likes = response.data.likes;
-          word.userLiked = false;
+          word.userLiked = response.data.liked;
+          delete word._optimisticLike;
+          
+          return { success: true, likes: response.data.likes };
+        } catch (error) {
+          // Rollback on error
+          word.likes = oldLikes;
+          word.userLiked = true;
+          delete word._optimisticLike;
+          
+          if (error.response?.status === 409) {
+            return { success: false, message: 'You already unliked this word' };
+          }
+          
+          return { success: false, message: error.response?.data?.message || 'Failed to unlike word' };
+        } finally {
+          this.isLiking = false;
+          idempotencyTracker.removePending(idempotencyKey);
         }
-        
-        return { success: true, likes: response.data.likes };
-      } catch (error) {
-        if (error.response?.status === 409) {
-          console.log('Duplicate unlike request detected');
-          return { success: false, message: 'You already unliked this word' };
-        }
-        
-        return { success: false, message: error.response?.data?.message || 'Failed to unlike word' };
-      } finally {
-        this.isLiking = false;
-        idempotencyTracker.removePending(idempotencyKey);
       }
+      
+      this.isLiking = false;
+      return { success: false, message: 'Word not found' };
     },
     
     async checkLikeStatus(wordId) {
@@ -1862,16 +1998,19 @@ export const useBookStore = defineStore('book', {
       
       try {
         const response = await axios.delete('/api/book/words', {
-          headers: {
-            'Idempotency-Key': idempotencyKey
-          }
+          headers: { 'Idempotency-Key': idempotencyKey }
         });
         
         this.words = [];
+        
+        if (this.socket) {
+          this.socket.emit('words-cleared');
+        }
+        
         return { success: true, deletedCount: response.data.deletedCount };
       } catch (error) {
         if (error.response?.status === 409) {
-          console.log('Duplicate delete all request detected');
+          await this.syncIncremental();
           return { success: false, message: 'Delete all operation already performed' };
         }
         
@@ -1882,33 +2021,144 @@ export const useBookStore = defineStore('book', {
       }
     },
     
-    async fetchWords() {
-      this.loading = true;
+    // Incremental sync - only fetch changes, not full reload
+    async syncIncremental() {
+      if (this._updateLock) return;
+      
+      this._updateLock = true;
+      
       try {
         const response = await axios.get('/api/book/words');
-        this.words = response.data;
+        const serverWords = response.data;
         
-        const token = localStorage.getItem('token');
-        if (token) {
-          const batchSize = 20;
-          for (let i = 0; i < this.words.length; i += batchSize) {
-            const batch = this.words.slice(i, i + batchSize);
-            await Promise.all(
-              batch.map(async (word) => {
-                const likeStatus = await this.checkLikeStatus(word._id);
-                word.userLiked = likeStatus.liked;
-                word.likes = likeStatus.likes;
-              })
-            );
+        // Create maps for comparison
+        const serverMap = new Map(serverWords.map(w => [w._id, w]));
+        const localMap = new Map(this.words.map(w => [w._id, w]));
+        
+        // Find added words (in server but not in local)
+        for (const serverWord of serverWords) {
+          if (!localMap.has(serverWord._id)) {
+            // Find correct position
+            const prevWordId = serverWord.prevWord;
+            let insertIndex = this.words.length;
+            
+            if (prevWordId) {
+              const prevIndex = this.words.findIndex(w => w._id === prevWordId);
+              if (prevIndex !== -1) {
+                insertIndex = prevIndex + 1;
+              }
+            } else {
+              insertIndex = 0; // Insert at beginning
+            }
+            
+            this.words.splice(insertIndex, 0, {
+              ...serverWord,
+              _fromSync: true
+            });
+            
+            setTimeout(() => {
+              const word = this.words.find(w => w._id === serverWord._id);
+              if (word) delete word._fromSync;
+            }, 300);
           }
         }
         
-        this.error = null;
+        // Find deleted words (in local but not in server, and not optimistic)
+        for (const localWord of this.words) {
+          if (!serverMap.has(localWord._id) && !localWord._optimistic) {
+            const index = this.words.findIndex(w => w._id === localWord._id);
+            if (index !== -1) {
+              this.words.splice(index, 1);
+            }
+          }
+        }
+        
+        // Update like counts for existing words
+        for (const serverWord of serverWords) {
+          const localWord = localMap.get(serverWord._id);
+          if (localWord && localWord.likes !== serverWord.likes) {
+            localWord.likes = serverWord.likes;
+            localWord.userLiked = serverWord.userLiked;
+          }
+        }
       } catch (error) {
-        this.error = 'Failed to load the book';
-        console.error(error);
+        console.error('Incremental sync failed:', error);
       } finally {
-        this.loading = false;
+        this._updateLock = false;
+      }
+    },
+    
+    // Initialize WebSocket for real-time updates
+    initWebSocket() {
+      this.socket = io('http://localhost:3000', {
+        auth: { token: localStorage.getItem('token') }
+      });
+      
+      this.socket.on('word-added', (data) => {
+        // Check if we already have this word
+        if (!this.words.some(w => w._id === data._id)) {
+          this.handleRemoteWordAdded(data);
+        }
+      });
+      
+      this.socket.on('word-deleted', (data) => {
+        this.handleRemoteWordDeleted(data.wordId);
+      });
+      
+      this.socket.on('words-cleared', () => {
+        this.words = [];
+      });
+    },
+    
+    handleRemoteWordAdded(newWord) {
+      // Find correct insertion position based on linked list
+      let insertIndex = this.words.length;
+      
+      if (newWord.prevWord) {
+        const prevIndex = this.words.findIndex(w => w._id === newWord.prevWord);
+        if (prevIndex !== -1) {
+          insertIndex = prevIndex + 1;
+        }
+      } else {
+        insertIndex = 0;
+      }
+      
+      this.words.splice(insertIndex, 0, {
+        ...newWord,
+        _remote: true
+      });
+      
+      setTimeout(() => {
+        const word = this.words.find(w => w._id === newWord._id);
+        if (word) delete word._remote;
+      }, 300);
+    },
+    
+    handleRemoteWordDeleted(wordId) {
+      const index = this.words.findIndex(w => w._id === wordId);
+      if (index !== -1 && !this.words[index]._optimistic) {
+        this.words[index]._deleting = true;
+        setTimeout(() => {
+          const currentIndex = this.words.findIndex(w => w._id === wordId);
+          if (currentIndex !== -1) {
+            this.words.splice(currentIndex, 1);
+          }
+        }, 200);
+      }
+    },
+    
+    // Periodic background sync (every 10 seconds as fallback)
+    startBackgroundSync() {
+      this.syncInterval = setInterval(() => {
+        if (!this.isAdding && !this.isDeleting && !this.isLiking) {
+          this.syncIncremental();
+        }
+      }, 10000);
+    },
+    
+    stopBackgroundSync() {
+      if (this.syncInterval) {
+        clearInterval(this.syncInterval);
       }
     }
   }
@@ -1976,7 +2226,9 @@ export const idempotencyTracker = new IdempotencyTracker();
 FILE: frontend/src/views/Book.vue
 ================================================================================
 
-[STRIPPED: 7995 bytes of style content]
+[STRIPPED: 8926 bytes of style content]
+
+<!-- frontend/src/views/Book.vue - Complete version with no loading spinner -->
 
 <template>
   <div class="book-container" :class="{ 'deleting-active': deletionLock || bookStore.isDeleting }">
@@ -2042,8 +2294,9 @@ FILE: frontend/src/views/Book.vue
       </div>
 
       <div class="document">
+        <!-- Initial loading only - never shows again -->
         <div 
-          v-if="bookStore.loading" 
+          v-if="bookStore.loading && bookStore.needsInitialLoad" 
           class="loading"
         >
           Loading document...
@@ -2055,7 +2308,7 @@ FILE: frontend/src/views/Book.vue
           ref="editorRef"
         >
           <div class="words-wrapper">
-            <!-- Insert at beginning indicator - only show when not in insert mode -->
+            <!-- Insert at beginning indicator -->
             <span 
               v-if="!deleteMode && activeInsertMode !== 'before' && !insertingAtBeginning" 
               class="insert-indicator insert-beginning"
@@ -2096,7 +2349,11 @@ FILE: frontend/src/views/Book.vue
                   'own-word': word.author === authStore.currentUser?.id,
                   'high-cost': deleteMode && word.deletionCost && word.deletionCost >= 100,
                   'medium-cost': deleteMode && word.deletionCost && word.deletionCost >= 10 && word.deletionCost < 100,
-                  'deleting': pendingDeletion === word._id
+                  'deleting': pendingDeletion === word._id || word._deleting,
+                  'optimistic': word._optimistic,
+                  'just-added': word._justAdded,
+                  'remote-added': word._remote,
+                  'optimistic-like': word._optimisticLike
                 }"
                 @click="handleWordClick($event, word)"
                 @mouseenter="showTooltip($event, word)"
@@ -2106,6 +2363,9 @@ FILE: frontend/src/views/Book.vue
                 <span class="like-button" @click.stop="toggleLike(word)">
                   {{ word.userLiked ? '❤️' : '🤍' }}
                 </span>
+                <span v-if="word.likes > 0" class="like-count">
+                  {{ word.likes }}
+                </span>
                 <span v-if="deleteMode && word.deletionCost && !isAdmin && word.author !== authStore.currentUser?.id" 
                       class="delete-cost"
                       :class="{
@@ -2114,9 +2374,11 @@ FILE: frontend/src/views/Book.vue
                       }">
                   {{ word.deletionCost }}
                 </span>
+                <span v-if="word._optimistic" class="status-badge">⏳</span>
+                <span v-if="word._remote" class="status-badge remote">✨</span>
               </span>
               
-              <!-- Insert after this word indicator - only show when not in insert mode for this position -->
+              <!-- Insert after this word indicator -->
               <span 
                 v-if="!deleteMode && !(activeInsertRefWord?._id === word._id)" 
                 class="insert-indicator insert-between"
@@ -2164,7 +2426,7 @@ FILE: frontend/src/views/Book.vue
       </div>
     </div>
 
-    <!-- Rest of your modals and messages... -->
+    <!-- Modals -->
     <div v-if="showConfirmModal" class="modal-overlay" @click.self="closeModal">
       <div class="modal-content">
         <h3>⚠️ Delete All Words</h3>
@@ -2195,14 +2457,13 @@ import { useBookStore } from '../stores/book'
 import { io } from 'socket.io-client'
 import WordInput from '../components/WordInput.vue'
 
-const socket = io('http://localhost:3000')
 const router = useRouter()
 const authStore = useAuthStore()
 const bookStore = useBookStore()
 
 const deleteMode = ref(false)
 const activeInsertMode = ref(null) // 'before', 'after', or null
-const activeInsertRefWord = ref(null) // The word to insert before/after (null means beginning or end)
+const activeInsertRefWord = ref(null)
 const message = ref('')
 const messageType = ref('info')
 const showConfirmModal = ref(false)
@@ -2214,7 +2475,7 @@ const isAddingWord = ref(false)
 const isLikingWord = ref(false)
 const insertingAtBeginning = ref(false)
 let messageTimeout = null
-let isProcessingRemoteUpdate = false
+let socket = null
 
 const isAdmin = computed(() => authStore.currentUser?.username === 'admin')
 
@@ -2244,7 +2505,6 @@ const activateInsertBefore = (word) => {
     return
   }
   
-  // Only allow insert at beginning
   if (word) {
     showMessage('Insert before mode only works at the beginning. Use insert after for other positions.', 'warning')
     return
@@ -2256,7 +2516,6 @@ const activateInsertBefore = (word) => {
     activeInsertMode.value = 'before'
     showMessage(`Insert mode active at beginning (before "${firstWord.text}")`, 'info')
   } else {
-    // Book is empty, just use after mode
     activeInsertMode.value = 'after'
     activeInsertRefWord.value = null
     showMessage('Book is empty, will add first word', 'info')
@@ -2269,9 +2528,6 @@ const cancelInsertMode = () => {
   showMessage('Insert mode cancelled', 'info')
 }
 
-// Store the word we're inserting after/before
-const lastInsertedAfterWord = ref(null)
-
 const handleWordSubmit = async ({ text }) => {
   if (isAddingWord.value || bookStore.isAdding) {
     showMessage('Please wait, already adding a word...', 'warning')
@@ -2281,7 +2537,6 @@ const handleWordSubmit = async ({ text }) => {
   isAddingWord.value = true
   saving.value = true
   
-  // Store current insert position before clearing
   const insertBeforeThis = activeInsertRefWord.value
   const currentMode = activeInsertMode.value
   
@@ -2301,20 +2556,16 @@ const handleWordSubmit = async ({ text }) => {
     await authStore.fetchUserStats()
     await nextTick()
     
-    // For both modes, automatically switch to after mode for continuous typing
+    // Auto-continue typing after successful add
     if (currentMode === 'after') {
-      // After mode: activate insert after the newly added word
       if (insertBeforeThis) {
-        // Find where we added the word (after the reference word)
         const refIndex = bookStore.words.findIndex(w => w._id === insertBeforeThis._id)
         if (refIndex !== -1 && refIndex + 1 < bookStore.words.length) {
-          // Activate after the word we just added
           activateInsertAfter(bookStore.words[refIndex + 1])
           showMessage(`Added "${text}"! Keep typing...`, 'success')
           return
         }
       } else if (insertBeforeThis === null) {
-        // Added at the end, activate after the last word (which is the newly added word)
         const lastWord = bookStore.words[bookStore.words.length - 1]
         if (lastWord) {
           activateInsertAfter(lastWord)
@@ -2323,8 +2574,6 @@ const handleWordSubmit = async ({ text }) => {
         }
       }
     } else if (currentMode === 'before') {
-      // Before mode (only at beginning): after adding, switch to after mode
-      // Activate insert after the newly added word (which is now at position 0)
       const firstWord = bookStore.words[0]
       if (firstWord) {
         activateInsertAfter(firstWord)
@@ -2333,12 +2582,26 @@ const handleWordSubmit = async ({ text }) => {
       }
     }
     
-    // If we couldn't auto-reactivate, just cancel mode
     cancelInsertMode()
     showMessage(`Added "${text}"!`, 'success')
   } else {
     showMessage(result.message, 'error')
     cancelInsertMode()
+  }
+}
+
+const enableDeleteMode = () => {
+  if (deletionLock.value || bookStore.isDeleting) {
+    showMessage('Please wait for current operation to complete', 'warning')
+    return
+  }
+  
+  if (isAdmin.value || authStore.deleteCredits > 0) {
+    deleteMode.value = true
+    updateDeletionCosts()
+    showMessage('Delete mode activated! Click on any word (not yours) to delete it', 'info')
+  } else {
+    showMessage('No delete credits available!', 'error')
   }
 }
 
@@ -2351,32 +2614,17 @@ const cancelDeleteMode = () => {
   showMessage('Delete mode deactivated', 'info')
 }
 
-const confirmDeleteAllWords = () => {
-  if (bookStore.wordCount === 0) {
-    showMessage('No words to delete', 'error')
-    return
-  }
-  showConfirmModal.value = true
-}
-
-const closeModal = () => {
-  showConfirmModal.value = false
-}
-
-const deleteAllWords = async () => {
-  showConfirmModal.value = false
-  saving.value = true
-  
-  const result = await bookStore.deleteAllWords()
-  
-  saving.value = false
-  
-  if (result.success) {
-    showMessage(`Successfully deleted all ${result.deletedCount} words!`, 'success')
-    cancelDeleteMode()
-    await authStore.fetchUserStats()
-  } else {
-    showMessage(result.message, 'error')
+const updateDeletionCosts = async () => {
+  if (deleteMode.value && !isAdmin.value) {
+    for (const word of bookStore.words) {
+      if (word.author !== authStore.currentUser?.id && !word._optimistic) {
+        const costInfo = await bookStore.getDeletionCost(word._id)
+        word.deletionCost = costInfo.cost
+        word.deviations = costInfo.deviations
+      } else {
+        word.deletionCost = 0
+      }
+    }
   }
 }
 
@@ -2444,7 +2692,6 @@ const handleWordClick = async (event, word) => {
       } else {
         if (result.alreadyDeleted) {
           showMessage('This word has already been deleted', 'warning')
-          await bookStore.fetchWords()
         } else {
           showMessage(result.message, 'error')
         }
@@ -2457,79 +2704,6 @@ const handleWordClick = async (event, word) => {
       pendingDeletion.value = null
       saving.value = false
     }
-  }
-}
-
-const updateDeletionCosts = async () => {
-  if (deleteMode.value && !isAdmin.value) {
-    for (const word of bookStore.words) {
-      if (word.author !== authStore.currentUser?.id) {
-        const costInfo = await bookStore.getDeletionCost(word._id)
-        word.deletionCost = costInfo.cost
-        word.deviations = costInfo.deviations
-      } else {
-        word.deletionCost = 0
-      }
-    }
-  }
-}
-
-const showTooltip = async (event, word) => {
-  let tooltipContent = `
-    ✍️ Written by: ${word.authorName}<br>
-    ❤️ Likes: ${word.likes || 0}
-  `
-  
-  if (deleteMode.value && !isAdmin.value && word.author !== authStore.currentUser?.id) {
-    let costInfo = word.deletionCost
-    if (!costInfo) {
-      costInfo = await bookStore.getDeletionCost(word._id)
-      word.deletionCost = costInfo.cost
-      word.deviations = costInfo.deviations
-    }
-
-    tooltipContent += `<br>💸 Deletion cost: ${costInfo} credit(s)`
-    if (costInfo.deviations >= 1) {
-      tooltipContent += `<br>📊 ${costInfo.deviations.toFixed(1)} std dev above average`
-    }
-  }
-  
-  const tooltip = document.createElement('div')
-  tooltip.className = 'word-tooltip'
-  tooltip.innerHTML = tooltipContent
-  tooltip.style.position = 'absolute'
-  tooltip.style.left = `${event.clientX + 10}px`
-  tooltip.style.top = `${event.clientY - 30}px`
-  tooltip.style.backgroundColor = '#2d3748'
-  tooltip.style.color = 'white'
-  tooltip.style.padding = '8px 12px'
-  tooltip.style.borderRadius = '4px'
-  tooltip.style.fontSize = '12px'
-  tooltip.style.pointerEvents = 'none'
-  tooltip.style.zIndex = '1000'
-  tooltip.style.whiteSpace = 'nowrap'
-  document.body.appendChild(tooltip)
-  event.target._tooltip = tooltip
-}
-
-const enableDeleteMode = () => {
-  if (deletionLock.value || bookStore.isDeleting) {
-    showMessage('Please wait for current operation to complete', 'warning')
-    return
-  }
-  
-  if (isAdmin.value || authStore.deleteCredits > 0) {
-    deleteMode.value = true
-    updateDeletionCosts()
-    showMessage('Delete mode activated! Click on any word (not yours) to delete it', 'info')
-  } else {
-    showMessage('No delete credits available!', 'error')
-  }
-}
-
-const hideTooltip = (event) => {
-  if (event.target._tooltip) {
-    event.target._tooltip.remove()
   }
 }
 
@@ -2568,6 +2742,79 @@ const toggleLike = async (word) => {
   }
 }
 
+const confirmDeleteAllWords = () => {
+  if (bookStore.wordCount === 0) {
+    showMessage('No words to delete', 'error')
+    return
+  }
+  showConfirmModal.value = true
+}
+
+const closeModal = () => {
+  showConfirmModal.value = false
+}
+
+const deleteAllWords = async () => {
+  showConfirmModal.value = false
+  saving.value = true
+  
+  const result = await bookStore.deleteAllWords()
+  
+  saving.value = false
+  
+  if (result.success) {
+    showMessage(`Successfully deleted all ${result.deletedCount} words!`, 'success')
+    cancelDeleteMode()
+    await authStore.fetchUserStats()
+  } else {
+    showMessage(result.message, 'error')
+  }
+}
+
+const showTooltip = async (event, word) => {
+  let tooltipContent = `
+    ✍️ Written by: ${word.authorName}<br>
+    ❤️ Likes: ${word.likes || 0}
+  `
+  
+  if (deleteMode.value && !isAdmin.value && word.author !== authStore.currentUser?.id) {
+    let costInfo = word.deletionCost
+    if (!costInfo && !word._optimistic) {
+      costInfo = await bookStore.getDeletionCost(word._id)
+      word.deletionCost = costInfo.cost
+      word.deviations = costInfo.deviations
+    }
+
+    tooltipContent += `<br>💸 Deletion cost: ${costInfo} credit(s)`
+    if (word.deviations >= 1) {
+      tooltipContent += `<br>📊 ${word.deviations.toFixed(1)} std dev above average`
+    }
+  }
+  
+  const tooltip = document.createElement('div')
+  tooltip.className = 'word-tooltip'
+  tooltip.innerHTML = tooltipContent
+  tooltip.style.position = 'absolute'
+  tooltip.style.left = `${event.clientX + 10}px`
+  tooltip.style.top = `${event.clientY - 30}px`
+  tooltip.style.backgroundColor = '#2d3748'
+  tooltip.style.color = 'white'
+  tooltip.style.padding = '8px 12px'
+  tooltip.style.borderRadius = '4px'
+  tooltip.style.fontSize = '12px'
+  tooltip.style.pointerEvents = 'none'
+  tooltip.style.zIndex = '1000'
+  tooltip.style.whiteSpace = 'nowrap'
+  document.body.appendChild(tooltip)
+  event.target._tooltip = tooltip
+}
+
+const hideTooltip = (event) => {
+  if (event.target._tooltip) {
+    event.target._tooltip.remove()
+  }
+}
+
 const logout = () => {
   authStore.logout()
   router.push('/')
@@ -2579,36 +2826,7 @@ const handleKeydown = (event) => {
   }
 }
 
-// Socket.io handlers
-socket.on('word-update', async () => {
-  if (!isProcessingRemoteUpdate) {
-    isProcessingRemoteUpdate = true
-    await bookStore.fetchWords()
-    isProcessingRemoteUpdate = false
-  }
-})
-
-socket.on('word-deleted', async () => {
-  if (!isProcessingRemoteUpdate) {
-    isProcessingRemoteUpdate = true
-    await bookStore.fetchWords()
-    isProcessingRemoteUpdate = false
-  }
-})
-
-onMounted(async () => {
-  await bookStore.fetchWords()
-  await authStore.fetchUserStats()
-  document.addEventListener('keydown', handleKeydown)
-})
-
-onUnmounted(() => {
-  if (messageTimeout) clearTimeout(messageTimeout)
-  document.removeEventListener('keydown', handleKeydown)
-  socket.off('word-update')
-  socket.off('word-deleted')
-})
-
+// Watch for delete mode changes
 watch(deleteMode, (newVal) => {
   if (newVal && !isAdmin.value && !deletionLock.value) {
     updateDeletionCosts()
@@ -2620,7 +2838,30 @@ watch(() => bookStore.words, () => {
     updateDeletionCosts()
   }
 }, { deep: true })
+
+onMounted(async () => {
+  // Initialize WebSocket for real-time updates
+  socket = io('http://localhost:3000')
+  bookStore.initWebSocket?.()
+  
+  // Initial load (only happens once)
+  await bookStore.loadInitialBook()
+  await authStore.fetchUserStats()
+  
+  // Start background sync
+  bookStore.startBackgroundSync?.()
+  
+  document.addEventListener('keydown', handleKeydown)
+})
+
+onUnmounted(() => {
+  if (messageTimeout) clearTimeout(messageTimeout)
+  document.removeEventListener('keydown', handleKeydown)
+  if (socket) socket.disconnect()
+  bookStore.stopBackgroundSync?.()
+})
 </script>
+
 
 
 
@@ -2844,6 +3085,6 @@ const handleRegister = async () => {
 STRIPPING STATISTICS
 ================================================================================
 Files with stripped styles: 7
-Total bytes stripped: 16,113
-Total stripped: 15.74 KB
+Total bytes stripped: 17,044
+Total stripped: 16.64 KB
 ================================================================================
