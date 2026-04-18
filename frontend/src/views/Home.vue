@@ -72,7 +72,7 @@ const hideTooltip = (event) => {
 }
 
 onMounted(async () => {
-  await bookStore.fetchWords()
+  await bookStore.loadInitialBook()
 })
 </script>
 
