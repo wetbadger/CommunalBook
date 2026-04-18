@@ -26,6 +26,20 @@ def load_ignore_patterns(ignore_file_path):
                 patterns.append(line)
     return patterns
 
+def load_test_ignore_patterns(test_ignore_file_path):
+    """Load ignore patterns from .llmtestignore file"""
+    patterns = []
+    if not os.path.exists(test_ignore_file_path):
+        return patterns
+    
+    with open(test_ignore_file_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            # Skip empty lines and comments
+            if line and not line.startswith('#'):
+                patterns.append(line)
+    return patterns
+
 def is_ignored(file_path, patterns, root_dir):
     """Check if a file matches any ignore pattern with proper * handling"""
     rel_path = os.path.relpath(file_path, root_dir)
@@ -216,6 +230,18 @@ def find_llmignore(start_dir):
     
     return None, None
 
+def find_llmtestignore(start_dir):
+    """Search for .llmtestignore file in current and parent directories"""
+    current = Path(start_dir).resolve()
+    
+    # Search up the directory tree
+    for parent in [current] + list(current.parents):
+        test_ignore_file = parent / '.llmtestignore'
+        if test_ignore_file.exists():
+            return test_ignore_file, parent
+    
+    return None, None
+
 def main():
     parser = argparse.ArgumentParser(
         description='Concatenate all non-ignored files into a single text file',
@@ -237,6 +263,11 @@ def main():
         action='store_true',
         help='Remove content inside <style> tags (useful for HTML/Vue files)'
     )
+    parser.add_argument(
+        '-t', '--hide-tests',
+        action='store_true',
+        help='Hide files that are listed in .llmtestignore'
+    )
     
     args = parser.parse_args()
     
@@ -256,24 +287,61 @@ def main():
     # Find .llmignore file (searching up from target directory)
     ignore_file_path, root_dir = find_llmignore(target_dir)
     
+    # Initialize ignore patterns
+    ignore_patterns = []
+    
+    # If --hide-tests, add .llmtestignore patterns
+    if args.hide_tests:
+        test_ignore_file_path, test_root_dir = find_llmtestignore(target_dir)
+        
+        if test_ignore_file_path:
+            print(f"Found .llmtestignore at: {test_ignore_file_path}")
+            test_patterns = load_test_ignore_patterns(test_ignore_file_path)
+            print(f"Loaded {len(test_patterns)} test ignore patterns:")
+            for p in test_patterns[:10]:  # Show first 10 patterns
+                print(f"  - {p}")
+            if len(test_patterns) > 10:
+                print(f"  ... and {len(test_patterns) - 10} more")
+            
+            # Add test patterns to ignore patterns
+            ignore_patterns.extend(test_patterns)
+        else:
+            print(f"Warning: --hide-tests specified but no .llmtestignore found in {target_dir} or any parent directory")
+    
+    # Load .llmignore patterns if it exists
     if ignore_file_path:
         print(f"Found .llmignore at: {ignore_file_path}")
         print(f"Using root directory: {root_dir}")
-        ignore_patterns = load_ignore_patterns(ignore_file_path)
-        print(f"Loaded {len(ignore_patterns)} ignore patterns:")
-        for p in ignore_patterns[:10]:  # Show first 10 patterns
+        llmignore_patterns = load_ignore_patterns(ignore_file_path)
+        print(f"Loaded {len(llmignore_patterns)} ignore patterns:")
+        for p in llmignore_patterns[:10]:  # Show first 10 patterns
             print(f"  - {p}")
-        if len(ignore_patterns) > 10:
-            print(f"  ... and {len(ignore_patterns) - 10} more")
+        if len(llmignore_patterns) > 10:
+            print(f"  ... and {len(llmignore_patterns) - 10} more")
+        
+        # Add llmignore patterns to ignore patterns
+        ignore_patterns.extend(llmignore_patterns)
     else:
         print(f"Warning: No .llmignore found in {target_dir} or any parent directory")
         response = input("Continue without ignoring files? (y/n): ")
         if response.lower() != 'y':
             sys.exit(1)
         root_dir = target_dir
-        ignore_patterns = []
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_patterns = []
+    for pattern in ignore_patterns:
+        if pattern not in seen:
+            seen.add(pattern)
+            unique_patterns.append(pattern)
+    ignore_patterns = unique_patterns
+    
+    if ignore_patterns:
+        print(f"\nTotal unique ignore patterns: {len(ignore_patterns)}")
     
     print(f"\nStrip style tags: {'YES' if args.strip_style else 'NO'}")
+    print(f"Hide test files: {'YES' if args.hide_tests else 'NO'}")
     
     print(f"\nScanning directory: {target_dir}")
     files_to_process = get_all_files(target_dir, ignore_patterns)

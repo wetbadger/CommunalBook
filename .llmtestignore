@@ -1,0 +1,6 @@
+tests/*
+frontend/tests/*
+backend/tests/*
+vitest.backend.config.js
+vitest.config.mjs
+vitest.frontend.config.mjs

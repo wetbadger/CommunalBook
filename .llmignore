@@ -19,6 +19,7 @@ frontend/vite.config.js
 
 scripts/*
 .llmignore
+.llmtestignore
 .gitignore
 TODO.txt
 
