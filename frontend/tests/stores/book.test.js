@@ -1,3 +1,4 @@
+// frontend/tests/stores/book.test.js
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { setActivePinia, createPinia } from 'pinia';
 import { useBookStore } from '../../src/stores/book';
@@ -6,9 +7,27 @@ import axios from 'axios';
 vi.mock('axios');
 
 describe('Book Store', () => {
+  let store;
+  let mockAuthStore;
+
   beforeEach(() => {
     setActivePinia(createPinia());
     vi.clearAllMocks();
+    
+    // Setup localStorage mock
+    global.localStorage.getItem.mockReturnValue('test-token');
+    
+    // Mock auth store
+    mockAuthStore = {
+      currentUser: { id: 'user1', username: 'testuser' },
+      token: 'test-token'
+    };
+    
+    store = useBookStore();
+    // Manually set authStore reference since it's not automatically injected in tests
+    store.authStore = mockAuthStore;
+    store.socket = null; // Disable socket for tests
+    store.needsInitialLoad = true;
   });
 
   it('should load book successfully', async () => {
@@ -19,7 +38,6 @@ describe('Book Store', () => {
     
     axios.get.mockResolvedValue({ data: mockWords });
     
-    const store = useBookStore();
     await store.loadInitialBook();
     
     expect(store.words.length).toBe(2);
@@ -32,9 +50,7 @@ describe('Book Store', () => {
     
     axios.post.mockResolvedValue({ data: mockWord });
     
-    const store = useBookStore();
     store.words = [{ _id: '1', text: 'Hello' }];
-    store.authStore = { currentUser: { id: 'user1', username: 'testuser' } };
     
     const result = await store.addWord('New');
     
@@ -43,7 +59,6 @@ describe('Book Store', () => {
   });
 
   it('should delete word successfully', async () => {
-    const store = useBookStore();
     store.words = [
       { _id: '1', text: 'Hello', author: 'user1' },
       { _id: '2', text: 'World', author: 'user1' }
@@ -59,7 +74,6 @@ describe('Book Store', () => {
   });
 
   it('should like word successfully', async () => {
-    const store = useBookStore();
     store.words = [
       { _id: '1', text: 'Hello', likes: 0, userLiked: false }
     ];
@@ -74,7 +88,6 @@ describe('Book Store', () => {
   });
 
   it('should unlike word successfully', async () => {
-    const store = useBookStore();
     store.words = [
       { _id: '1', text: 'Hello', likes: 1, userLiked: true }
     ];
@@ -96,7 +109,6 @@ describe('Book Store', () => {
     
     axios.get.mockResolvedValue({ data: serverWords });
     
-    const store = useBookStore();
     store.words = [{ _id: '1', text: 'Hello', likes: 0 }];
     
     await store.syncIncremental();

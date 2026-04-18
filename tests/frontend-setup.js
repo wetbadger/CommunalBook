@@ -1,8 +1,20 @@
+// tests/frontend-setup.js
 import { config } from '@vue/test-utils';
 import { vi } from 'vitest';
+import { JSDOM } from 'jsdom';
+
+// Ensure DOM event constructors are available
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>', {
+  url: 'http://localhost:5173',
+  pretendToBeVisual: true
+});
+
+global.window = dom.window;
+global.document = dom.window.document;
+global.navigator = dom.window.navigator;
 
 // Mock localStorage
-const localStorageMock = {
+global.localStorage = {
   getItem: vi.fn(),
   setItem: vi.fn(),
   clear: vi.fn(),
@@ -10,25 +22,15 @@ const localStorageMock = {
   length: 0,
   key: vi.fn()
 };
-global.localStorage = localStorageMock;
 
 // Mock sessionStorage
-const sessionStorageMock = {
+global.sessionStorage = {
   getItem: vi.fn(),
   setItem: vi.fn(),
   clear: vi.fn(),
   removeItem: vi.fn(),
   length: 0,
   key: vi.fn()
-};
-global.sessionStorage = sessionStorageMock;
-
-// Mock window object
-global.window = {
-  ...global.window,
-  location: {
-    href: 'http://localhost:5173'
-  }
 };
 
 // Mock socket.io-client

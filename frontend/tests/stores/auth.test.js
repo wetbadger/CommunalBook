@@ -1,3 +1,4 @@
+// frontend/tests/stores/auth.test.js
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { setActivePinia, createPinia } from 'pinia';
 import { useAuthStore } from '../../src/stores/auth';
@@ -8,8 +9,16 @@ vi.mock('axios');
 describe('Auth Store', () => {
   beforeEach(() => {
     setActivePinia(createPinia());
-    localStorage.clear();
     vi.clearAllMocks();
+    
+    // Reset localStorage mock before each test
+    global.localStorage.getItem.mockReset();
+    global.localStorage.setItem.mockReset();
+    global.localStorage.clear.mockReset();
+    global.localStorage.removeItem.mockReset();
+    
+    // Setup default mock returns
+    global.localStorage.getItem.mockReturnValue(null);
   });
 
   it('should initialize with no user', () => {
@@ -34,7 +43,7 @@ describe('Auth Store', () => {
     expect(result.success).toBe(true);
     expect(store.isAuthenticated).toBe(true);
     expect(store.token).toBe('test-token');
-    expect(localStorage.getItem('token')).toBe('test-token');
+    expect(global.localStorage.setItem).toHaveBeenCalledWith('token', 'test-token');
   });
 
   it('should handle login failure', async () => {
@@ -77,6 +86,6 @@ describe('Auth Store', () => {
     
     expect(store.isAuthenticated).toBe(false);
     expect(store.token).toBe(null);
-    expect(localStorage.getItem('token')).toBe(null);
+    expect(global.localStorage.removeItem).toHaveBeenCalledWith('token');
   });
 });

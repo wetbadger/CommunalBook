@@ -21,3 +21,7 @@ scripts/*
 .llmignore
 .gitignore
 TODO.txt
+
+package.json
+package-lock.json
+node_modules/*

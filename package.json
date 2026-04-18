@@ -1,13 +1,23 @@
 {
   "scripts": {
-    "test": "vitest run --config vitest.backend.config.js",
-    "test:watch": "vitest --config vitest.backend.config.js",
-    "test:coverage": "vitest run --config vitest.backend.config.js --coverage",
-    "test:ui": "vitest --ui --config vitest.backend.config.js"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:ui": "vitest --ui",
+    "test:backend": "vitest run --config vitest.backend.config.js",
+    "test:backend:watch": "vitest --config vitest.backend.config.js",
+    "test:frontend": "vitest run --config vitest.frontend.config.mjs",
+    "test:frontend:watch": "vitest --config vitest.frontend.config.mjs",
+    "test:all": "npm run test:backend && npm run test:frontend"
   },
   "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.6",
     "@vitest/coverage-v8": "^1.6.1",
     "@vitest/ui": "^1.6.1",
+    "@vue/test-utils": "^2.4.6",
+    "@vue/vue3-jest": "^29.2.6",
+    "happy-dom": "^20.9.0",
+    "jsdom": "^29.0.2",
     "supertest": "^6.3.4",
     "vitest": "^1.6.1"
   }

@@ -1,6 +1,9 @@
 import { defineConfig } from 'vitest/config';
 import vue from '@vitejs/plugin-vue';
 import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   plugins: [vue()],
@@ -18,10 +21,6 @@ export default defineConfig({
         'frontend/tests/',
         '**/*.config.js',
       ]
-    },
-    transform: {
-      '^.+\\.vue$': '@vue/vue3-jest',
-      '^.+\\.js$': 'babel-jest'
     }
   },
   resolve: {
